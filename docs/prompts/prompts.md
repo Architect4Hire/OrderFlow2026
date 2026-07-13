@@ -6,7 +6,7 @@
 
 ## How to use this library
 
-Each prompt follows the **SCRUB framework** from the *SCRUB & Prompt Engineering Deep Dive* deck:
+Each prompt follows the **SCRUB framework** from the *Practical AI Assisted Development* book:
 
 - **[S] Scope** — name the exact deliverable and methods. If it takes more than three sentences, split it.
 - **[C] Constraints** — framework, architecture, naming, DI, messaging, testing. Match the codebase.
@@ -122,11 +122,11 @@ PREFERRED — Do NOT:
 ```text
 [S] Create `src/OrderFlow.Contracts/OrderFlow.Contracts.csproj` (classlib, net10.0)
     plus one file per message group under `Messages/`:
-    - `Messages/Commands.cs` — records: ReserveInventory, ReleaseInventory,
-      ChargePayment, RefundPayment, DispatchFulfillment.
-    - `Messages/Events.cs` — records: OrderPlaced, InventoryReserved,
+    - `Messages/Commands` — records: ReserveInventory, ReleaseInventory,
+      ChargePayment, RefundPayment, DispatchFulfillment. Create a class file per record
+    - `Messages/Events` — records: OrderPlaced, InventoryReserved,
       InventoryRejected, PaymentSucceeded, PaymentDeclined, FulfillmentDispatched,
-      FulfillmentFailed, OrderConfirmed, OrderFailed.
+      FulfillmentFailed, OrderConfirmed, OrderFailed.  Create a class file per record
     - `Messages/MessageBase.cs` — an abstract record or interface carrying
       Guid MessageId, Guid CorrelationId (the OrderId), DateTime OccurredUtc.
     Every command and event derives from / implements the base.
@@ -292,7 +292,7 @@ PREFERRED — Do NOT:
 > The Order service owns the workflow. It is the reference implementation for the
 > onion layering AND the home of the saga. Once Order is complete, the reacting
 > services (Inventory, Payment, Fulfillment, Notification) follow the same layered
-> pattern with their own domain. This is the **layered SCRUB** pattern from slide 23.
+> pattern with their own domain. This is the **layered SCRUB** pattern from the book.
 
 ## Prompt B1 — Order API csproj + folder skeleton 🤖
 
