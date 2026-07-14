@@ -22,7 +22,7 @@ An Angular front end calls an **Order** service, which runs a **saga** that orch
 | ---------------------- | ------------------------------------------------------------------ |
 | [`/docs`](.)           | This baseline — HLD, ADRs, delivery plan, walkthroughs, known gaps |
 | [`/src`](../src)       | The scaffolded system the docs describe                            |
-| [`/prompts`](/prompts/prompts.md) | The SCRUB prompt library and AI-assisted-development assets        |
+| [`/prompts`](prompts/prompts.md) | The SCRUB prompt library and AI-assisted-development assets        |
 
 ## A note on how this was built
 
