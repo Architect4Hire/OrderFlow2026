@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "OrderFlow.Orders.API": {
+      "commandName": "Project",
+      "launchBrowser": true,
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      },
+      "applicationUrl": "https://localhost:59094;http://localhost:59095"
+    }
+  }
+}

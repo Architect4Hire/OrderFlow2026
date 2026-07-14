@@ -104,7 +104,7 @@ PREFERRED — Do NOT:
 ## Prompt A1 — Create the solution and `global.json` 💬
 
 ```text
-[S] Create an empty .NET solution named `OrderFlow.sln` and a `global.json` at
+[S] Create an empty .NET solution named `OrderFlow.slnx` and a `global.json` at
     the repo root pinning the SDK to 10.0.100 with rollForward latestFeature.
 
 [C] .NET 10 LTS. No projects yet — just the .sln and global.json.
@@ -145,7 +145,8 @@ PREFERRED — Do NOT:
     3. Include a `Reason` string on success events — only on the *Rejected/
        Declined/Failed* ones.
     4. Version messages inline — if we need V2 later, add a new record. Leave a
-       `// TODO: message versioning strategy` comment at the top of Events.cs.
+       `// TODO: message versioning strategy` comment at the top of MessageBase.cs
+       (there is no Events.cs — [S] mandates one file per record).
 
 [U] The ONLY thing shared across services. Producers and consumers both bind to
     these types, so drift here is what breaks a distributed build. This is the
@@ -163,7 +164,7 @@ PREFERRED — Do NOT:
     (InventoryDb, PaymentDb); a Cosmos DB emulator with one database (OrderEventsDb);
     a Redis container (order status read model); a Service Bus emulator with the
     queues/topics OrderFlow needs; five not-yet-existing API projects referenced as
-    Projects.OrderFlow_Order_API, _Inventory_API, _Payment_API, _Fulfillment_API,
+    Projects.OrderFlow_Orders_API, _Inventory_API, _Payments_API, _Fulfillment_API,
     _Notification_API; and one Angular npm app at `../OrderFlow.Web` on port 4200.
 
 [C] - Use `<Sdk Name="Aspire.AppHost.Sdk" Version="13.3.0" />` as an inline SDK
@@ -172,24 +173,35 @@ PREFERRED — Do NOT:
     - Target `net10.0`
     - PackageReferences: Aspire.Hosting.AppHost, Aspire.Hosting.SqlServer,
       Aspire.Hosting.Azure.CosmosDB, Aspire.Hosting.Redis,
-      Aspire.Hosting.Azure.ServiceBus, Aspire.Hosting.NodeJs (all 13.3-aligned).
+      Aspire.Hosting.Azure.ServiceBus, Aspire.Hosting.JavaScript (all 13.3-aligned).
+      (NOT Aspire.Hosting.NodeJs — it stops at 9.5.2 and has no 13.x release.)
     - SQL password via `builder.AddParameter("sql-password", secret: true)`.
     - SQL Server: `.WithDataVolume("orderflow-sql-data")
       .WithLifetime(ContainerLifetime.Persistent)`.
     - Cosmos: use the Cosmos DB EMULATOR (`.RunAsEmulator(...)`), NOT a live account.
+      Declare the DATABASE **and the container**: `AddCosmosDatabase("OrderEventsDb")`
+      then `.AddContainer("order-events", "/orderId")`. A database with no container is
+      not a build error — it is a 404 at H2, which is a much worse place to find it.
+      Point the Order API at the CONTAINER resource, not the database (Prompt B5).
     - Service Bus: use the Service Bus EMULATOR (`.RunAsEmulator(...)`). Declare the
       queues (per-command) and topics+subscriptions (per-event) the services need.
+      OPEN: the `order-placed` topic currently has no subscriber AND no publisher —
+      B7 appends OrderPlaced to the event store but never publishes it. Either have
+      Business also `PublishEventAsync(orderPlaced)`, or drop the topic. Right now it is
+      dead infrastructure.
     - Each API: `.WithReference(<its resources>).WaitFor(<its resources>)
       .WithExternalHttpEndpoints()`. Order API references Cosmos + Redis + Service Bus;
       Inventory + Payment reference SQL + Service Bus; Fulfillment + Notification
       reference Service Bus only.
-    - Angular: `.AddNpmApp("web", "../OrderFlow.Web", "start")
+    - Angular: `.AddJavaScriptApp("web", "../OrderFlow.Web", "start")
       .WithHttpEndpoint(port: 4200, env: "PORT")` with env vars pointing at the
       Order API (customer status) and the Order/Inventory/Payment APIs (ops view),
-      then `.PublishAsDockerFile()`.
+      then `.PublishAsDockerFile()`. (AddNpmApp is retired; AddJavaScriptApp takes
+      the identical three arguments.)
     - `Properties/launchSettings.json` MUST exist with two profiles (http, https),
-      each setting `applicationUrl` and the three Aspire dashboard OTLP endpoint env
-      vars, with distinct ports across profiles. Without this file, `dotnet run`
+      each setting `applicationUrl` and the two Aspire dashboard endpoint env vars
+      (ASPIRE_DASHBOARD_OTLP_ENDPOINT_URL, ASPIRE_RESOURCE_SERVICE_ENDPOINT_URL),
+      with distinct ports across profiles. Without this file, `dotnet run`
       returns immediately with no dashboard — a silent no-op.
     - `appsettings.Development.json` may include a `Parameters:sql-password` fallback
       so first-time `dotnet run` succeeds without a manual `dotnet user-secrets set`.
@@ -265,10 +277,22 @@ PREFERRED — Do NOT:
       registering the bus and the idempotency store.
 
 [C] - Use the Azure.Messaging.ServiceBus SDK (works against the emulator unchanged).
+    - Add PackageReference Aspire.Azure.Messaging.ServiceBus (13.3-aligned) and
+      register the client with `builder.AddAzureServiceBusClient("servicebus")` so the
+      connection string comes from the AppHost resource reference, never from config.
+    - Add a ProjectReference from ServiceDefaults to ../OrderFlow.Contracts — the bus
+      is generic over MessageBase so it can read CorrelationId/MessageId. Contracts
+      stays a leaf; nothing flows the other way.
+    - Resolve the queue/topic name from the message type: kebab-case of the type name
+      (ReserveInventory → `reserve-inventory`). That convention is the contract between
+      Contracts and the entities the AppHost declares.
     - The idempotency store may be backed by the service's own SQL/Cosmos context for
       the POC; leave a `// TODO: shared durable store` comment.
     - Trace context propagation uses the standard W3C traceparent on the message
       ApplicationProperties.
+    - MessageBase is immutable and `with` is illegal on a type parameter, so stamp
+      MessageId by patching the serialized JsonObject and mirror it onto the
+      ServiceBusMessage envelope (consumers dedupe from the envelope).
 
 [R] CRITICAL — Do NOT:
     1. Swallow send/publish exceptions. A failed publish must surface so the saga can
@@ -297,23 +321,37 @@ PREFERRED — Do NOT:
 ## Prompt B1 — Order API csproj + folder skeleton 🤖
 
 ```text
-[S] Create `src/OrderFlow.Order.API/OrderFlow.Order.API.csproj` as a
+[S] Create `src/OrderFlow.Orders.API/OrderFlow.Orders.API.csproj` as a
     Microsoft.NET.Sdk.Web project, plus the empty `Managers/` tree: DataContext/,
     Domain/, ViewModels/, ServiceModels/, Extensions/, Data/, Business/, Facades/,
-    Consumers/, Saga/, and a top-level Controllers/ folder.
+    Consumers/, Saga/, and a top-level Controllers/ folder. Also add a placeholder
+    `Program.cs` (see [R]3).
 
-[C] - Target net10.0, nullable+ImplicitUsings on, RootNamespace OrderFlow.Order.API
+[C] - Target net10.0, nullable+ImplicitUsings on, RootNamespace OrderFlow.Orders.API
+    - PLURAL namespace is deliberate. `OrderFlow.Order.API` + the `Order` entity of
+      Prompt B2 is a CS0118 collision: inside any sibling namespace the identifier
+      `Order` binds to the enclosing NAMESPACE, not the class, and a normally-placed
+      `using` cannot win. Same trap for Payment → use OrderFlow.Payments.API.
+      Inventory/Fulfillment/Notification have no colliding entity and stay singular.
     - PackageReferences: Aspire.Microsoft.Azure.Cosmos, Aspire.StackExchange.Redis,
-      Azure.Messaging.ServiceBus, Swashbuckle.AspNetCore
+      Azure.Messaging.ServiceBus, Scalar.AspNetCore
     - ProjectReference to ../OrderFlow.ServiceDefaults AND ../OrderFlow.Contracts
 
 [R] CRITICAL — Do NOT:
     1. Add a Domain folder outside `Managers/Domain/`. Exactly ONE per service.
     2. ProjectReference any other service. Contracts + ServiceDefaults only.
     IMPORTANT — Do NOT:
-    3. Create any code files yet — only the csproj and empty directories.
+    3. Create any code files beyond a placeholder `Program.cs` — csproj and empty
+       directories otherwise. The Web SDK needs an entry point or the whole solution
+       fails CS5001 ("no static 'Main'") for the ten prompts until B11 lands, which
+       costs you `dotnet build` as the green/red gate on every one of them. Stub it
+       as `WebApplication.CreateBuilder(args).Build().Run();` with a TODO naming B11,
+       which replaces it wholesale.
 
 [U] Skeleton step before domain, models, layers, saga, consumers, controller.
+    Reuse this prompt verbatim for the other four services — the library has no
+    separate csproj/skeleton prompt for Inventory, Payments, Fulfillment, or
+    Notification, so C1/D1/E1/F1 all assume a project that this step creates.
 
 [B] N/A.
 ```
@@ -329,7 +367,7 @@ PREFERRED — Do NOT:
       List<OrderLine> Lines.
     - class OrderLine: Id, OrderId, Sku (string), Quantity (int), UnitPrice (decimal).
 
-[C] - Namespace `OrderFlow.Order.API.Managers.Domain`
+[C] - Namespace `OrderFlow.Orders.API.Managers.Domain` (plural — see B1 [C])
     - All string properties initialized to `string.Empty`
     - XML doc-comment on Order noting it is the saga aggregate root
 
@@ -353,11 +391,23 @@ PREFERRED — Do NOT:
       List<OrderLineViewModel> Lines (Required, MinLength 1); OrderLineViewModel has
       Sku (Required), Quantity (Range 1..100), UnitPrice (Range 0.0..99999.99).
     - `Managers/ServiceModels/OrderServiceModel.cs` — Id, CustomerRef, State (string),
-      Subtotal, Total, FailureReason, Lines (as service-model lines), timestamps.
+      Subtotal, Total, FailureReason, Lines (as service-model lines: Id, Sku, Quantity,
+      UnitPrice, and a derived LineTotal), timestamps.
+
+[C] - Money Ranges use the DECIMAL overload:
+      `[Range(typeof(decimal), "0.0", "99999.99", ParseLimitsInInvariantCulture = true)]`.
+      The (double, double) overload round-trips money through binary floating point and
+      can misjudge exactly the boundary value 99999.99.
 
 [R] CRITICAL — Do NOT:
     1. Accept State, Id, Subtotal, or Total on the incoming ViewModel — all server-
        controlled. The client sends lines; the server prices and drives state.
+       OPEN TENSION: [S] nonetheless puts UnitPrice on OrderLineViewModel, so the client
+       DOES price the order — and therefore controls Total, and therefore the amount
+       ChargePayment authorizes. Implemented as [S] says, with a `// TODO:` at the
+       property. Resolve by either (a) pricing from the SKU server-side (needs a price
+       source — StockItem has none), or (b) recording it as an explicit POC
+       simplification in an ADR. Do not leave it merely implicit.
     IMPORTANT — Do NOT:
     2. Reference the Domain model from either file.
 
@@ -375,11 +425,26 @@ PREFERRED — Do NOT:
       State=Placed, computes Subtotal and Total rounded to 2 dp, UTC timestamps).
     - ToServiceModel(this Order) → OrderServiceModel (State via .ToString()).
     - ToServiceModels(this IEnumerable<Order>).
+    - ToMessageLines(this IEnumerable<Domain.OrderLine>) → IReadOnlyList<Contracts
+      OrderLine>. ReserveInventory and DispatchFulfillment need it, and mapping belongs
+      here rather than as a private copy in Business (Prompt B7).
 
 [C] - String copies use `.Trim()`; decimals via `decimal.Round(x, 2)`; timestamps
-      from `DateTime.UtcNow`.
+      from `DateTime.UtcNow`. Read the clock ONCE per aggregate so a freshly placed
+      order has CreatedUtc == UpdatedUtc exactly, not microseconds apart.
+    - Domain.OrderLine and Contracts.OrderLine share a name deliberately (persisted vs
+      on the wire). This file is the only place both are in scope, so alias one:
+      `using ContractLine = OrderFlow.Contracts.Messages.OrderLine;`
     - For the POC, Total == Subtotal (no tax/shipping here — that is not what this
       demo proves). Leave a `// TODO: pricing engine` comment.
+    - Rounding, two known sharp edges — decide, don't inherit:
+      (a) `decimal.Round(x, 2)` is BANKER'S rounding (MidpointRounding.ToEven), so
+          2.005 → 2.00. Correct for accounting, surprising for retail.
+      (b) Subtotal is round(Σ qty×price) while each LineTotal is round(qty×price).
+          These can disagree if a client posts a UnitPrice with >2 decimal places
+          (Range bounds magnitude, not scale), so the status view can show lines that
+          visibly don't add up. Fix by summing the ROUNDED line totals, or by
+          constraining UnitPrice to 2dp on the ViewModel.
 
 [R] CRITICAL — Do NOT:
     1. Use AutoMapper/Mapster/reflection. Hand-rolled assignments only.
@@ -404,15 +469,38 @@ PREFERRED — Do NOT:
 [C] - Append-only. Events are never updated or deleted.
     - Partition key = OrderId so one order's stream reads from a single partition
       (this is the ADR-002 justification made real).
-    - Use the Aspire-registered Cosmos client.
+    - Use the Aspire-registered Cosmos client: `builder.AddAzureCosmosContainer(
+      "order-events", configureClientOptions: ...)` resolves a `Container` straight
+      into DI from the AppHost resource — no database/container name strings in the
+      data layer, no connection string anywhere.
+    - The AppHost must DECLARE the container (A3 only declared the database):
+      `orderEventsDb.AddContainer("order-events", "/orderId")`, and the Order API
+      references the CONTAINER, not the database.
+    - LOAD-BEARING: set `options.UseSystemTextJsonSerializerWithOptions =
+      new JsonSerializerOptions(JsonSerializerDefaults.Web)`. The partition key path is
+      "/orderId" (camelCase), but the Cosmos SDK's default serializer writes properties
+      as declared — "OrderId" — and EVERY write fails on a partition-key mismatch.
+      Bundle this into an `AddOrderEventStore(this IHostApplicationBuilder)` extension
+      so B11 cannot forget it or "tidy away" the options lambda.
+    - Cosmos requires the document key to be named `id`: `[JsonPropertyName("id")]` on
+      EventId.
 
 [R] CRITICAL — Do NOT:
-    1. Update or delete an existing event. Ever. Append is the only write.
+    1. Update or delete an existing event. Ever. Append is the only write. Use
+       `CreateItemAsync`, NEVER `UpsertItemAsync` — upsert is the more convenient call,
+       it looks harmless, and it silently overwrites, turning the audit trail into a
+       mutable record. A colliding id must throw.
     2. Query across partitions on the hot path — status reads come from Redis, not a
-       cross-partition Cosmos scan.
+       cross-partition Cosmos scan. Pin `QueryRequestOptions.PartitionKey`; omit it and
+       Cosmos silently fans out across every partition, which still WORKS, which is what
+       makes it dangerous.
     IMPORTANT — Do NOT:
     3. Store the mutable Order aggregate here. This is the EVENT log; the aggregate's
        current state is projected into the read model (Prompt B6).
+    4. Claim a total order from OccurredUtc alone. Two events appended in the same clock
+       tick tie, and Cosmos cannot break the tie on a second field without a composite
+       index. Leave a `// TODO:` — a real event store carries a monotonic per-stream
+       sequence number, and adding it after the saga is writing is expensive.
 
 [U] The system of record for what happened to an order. The saga appends to it on
     every transition; it is the audit trail a client sees in a trace.
@@ -429,15 +517,34 @@ PREFERRED — Do NOT:
     ListActiveAsync(CancellationToken) → the not-yet-terminal orders (for ops).
     Back it with the Aspire-registered Redis connection.
 
-[C] - Key per order (e.g. `order:{id}`); serialize the OrderServiceModel as JSON.
+[C] - `builder.AddRedisClient("redis")` registers IConnectionMultiplexer. Wrap it in an
+      `AddOrderReadModel(this IHostApplicationBuilder)` extension for B11.
+    - Key per order (e.g. `order:{id}`); serialize the OrderServiceModel as JSON.
     - "Active" = State not in { Confirmed, Failed }. Maintain a set for cheap listing.
+    - Write the document and the active-set membership in ONE MULTI/EXEC
+      (`db.CreateTransaction()`). As two separate calls, a failure between them strands a
+      Confirmed order in the ops "in flight" list forever, or hides an in-flight order
+      from ops — the projection-drifts-from-reality bug that makes people stop trusting
+      a read model and start reading the event log on every poll, which is precisely what
+      ADR-003 exists to avoid.
+    - Derive "terminal" by `Enum.TryParse<OrderState>`, not by string comparison, so
+      renaming a state is a compile error here rather than an order that silently never
+      leaves the ops list.
+    - ListActive: one SMEMBERS then ONE MGET, not N round trips — the ops view polls it.
+      Skip set members whose document is missing rather than throwing; a drifted set
+      should degrade one row, not the whole view.
+    - GOTCHA: RedisValue converts implicitly to BOTH string and ReadOnlySpan<byte>, so
+      `JsonSerializer.Deserialize(payload)` and `Guid.Parse(id)` are ambiguous (CS0121).
+      Cast explicitly: `(string)payload!`.
 
 [R] CRITICAL — Do NOT:
     1. Treat Redis as the system of record. It is a projection/cache — it can be
        rebuilt from the Cosmos event stream. Leave a `// TODO: rebuild-from-stream`
-       comment.
+       comment. Flushing Redis must leave the system degraded, never WRONG: the ops list
+       goes empty until new orders arrive, and not one order is lost.
     IMPORTANT — Do NOT:
-    2. Compute status here. The saga sets it; this store only persists/serves it.
+    2. Compute status here. The saga sets it; this store only persists/serves it. The
+       single judgement it may make is classifying terminal vs active, per [C].
 
 [U] Serves the customer status view and the ops list without touching the event log
     each poll. This is the "light CQRS read model" from Data & Persistence (ADR-003).
@@ -457,16 +564,33 @@ PREFERRED — Do NOT:
     - Business.ListActiveAsync() → read model.
     - Facade methods mirror these, one-liners delegating to Business.
 
-[C] - Business depends on IOrderEventStore, IOrderReadModel, IMessageBus, and the
-      saga entry point — NOT on EF/Cosmos/Redis SDK types directly.
+[C] - Business depends on IOrderEventStore, IOrderReadModel and IMessageBus — NOT on
+      EF/Cosmos/Redis SDK types directly. (This line USED to say "and the saga entry
+      point". There isn't one: B8's IOrderSaga is six On* reaction methods and no Start.
+      See [R]2.)
     - Facade depends on IOrderBusinessManager only.
+    - CorrelationId IS the OrderId, set once in PlaceAsync and never regenerated. Leave
+      MessageId unset on bus-bound messages — the bus stamps it (A5).
+    - Order of operations is APPEND → PROJECT → SEND, deliberately. A failed append means
+      nothing was sent and the order simply does not exist. The reverse would leave the
+      saga running against an order with no record of it — strictly worse.
 
 [R] CRITICAL — Do NOT:
     1. Reference Cosmos/Redis/ServiceBus SDK types from the Facade.
-    2. Drive later saga steps from Business. Business only STARTS the saga (publishes
-       the first command). Everything after is consumer-driven (Prompt B9).
+    2. Drive later saga steps from Business. Business only STARTS the saga (sends the
+       first command, ReserveInventory). Everything after is consumer-driven (B9).
+       OPEN TENSION: this means "the first step of a placed order is to reserve
+       inventory" lives in Business — the one piece of orchestration outside the saga,
+       and exactly what diagnostic I6 is written to catch. To close it, add a StartAsync
+       bullet to B8's [S] and have Business call that instead (~6 lines). Recommended:
+       B8 is the file a reviewer opens first.
     IMPORTANT — Do NOT:
     3. Return Domain entities from any method.
+    4. Pretend the three writes are atomic. Append (Cosmos) → project (Redis) → send
+       (Service Bus) has no transaction across it: if the send throws, the order sits at
+       Placed with no saga running. Leave a `// TODO: outbox`. Note this stuck order is
+       DEMONSTRABLE, not theoretical — the ops view has a stuck-orders panel and H3 is a
+       failure-injection walkthrough, so it may be a feature rather than a bug.
 
 [U] The Facade is the only thing the Controller depends on. Business is where "place
     an order" is coordinated.
@@ -576,20 +700,30 @@ PREFERRED — Do NOT:
 ## Prompt B11 — Order Program.cs wiring 🤖
 
 ```text
-[S] Create `Program.cs` for the Order API: AddServiceDefaults, register the Cosmos
-    event store, Redis read model, OrderFlow messaging (AddOrderFlowMessaging), DI
-    for Business → Facade and the saga (Scoped), the hosted consumers, Controllers,
-    Swagger, and a CORS policy "WebCors" for localhost:4200. Enable Swagger UI in
-    Development. Register the Service Bus subscriptions/queues this service listens on.
+[S] REPLACE the placeholder `Program.cs` from B1 wholesale. Order API wiring:
+    AddServiceDefaults, `AddOrderEventStore()` (B5), `AddOrderReadModel()` (B6),
+    `AddOrderFlowMessaging()` (A5), DI for Business → Facade and the saga (Scoped),
+    the hosted consumers, Controllers, Scalar, and a CORS policy "WebCors" for
+    localhost:4200. Enable the API reference UI in Development. Register the Service
+    Bus subscriptions/queues this service listens on.
+
+[C] - Call the AddOrderEventStore / AddOrderReadModel / AddOrderFlowMessaging
+      extensions rather than open-coding AddAzureCosmosContainer / AddRedisClient /
+      AddAzureServiceBusClient. Each one carries a setting that is silently fatal if
+      dropped — most of all the Cosmos camelCase serializer (B5 [C]), without which
+      every append fails on a partition-key mismatch.
+    - The API-reference UI is Scalar (`Scalar.AspNetCore`, per B1), not Swashbuckle.
 
 [R] CRITICAL — Do NOT:
     1. Allow CORS from `*` — only the web origin.
     2. Start consuming before the read model/event store connections are registered.
     IMPORTANT — Do NOT:
-    3. Expose Swagger in non-Development.
+    3. Expose the API-reference UI in non-Development.
 
 [U] Entrypoint Aspire executes. Resource connection names MUST match those declared
-    in the AppHost (OrderEventsDb, the Redis resource, the Service Bus resource).
+    in the AppHost: the Cosmos CONTAINER `order-events` (not the OrderEventsDb
+    database — see B5), the Redis resource `redis`, the Service Bus resource
+    `servicebus`.
 
 [B] N/A.
 ```
@@ -708,6 +842,11 @@ PREFERRED — Do NOT:
       Declined=2, Refunded=3 }; class Payment: Id, OrderId, Amount (decimal),
       Status, AuthorizationCode (string), IdempotencyKey (string), timestamps.
     - ServiceModels exposing per-order payment attempt history for the ops view.
+
+[C] - Namespace `OrderFlow.Payments.API.Managers.Domain` — PLURAL. Singular
+      `OrderFlow.Payment.API` plus the `Payment` entity above is the same CS0118
+      namespace/type collision described in B1 [C].
+    - All string properties initialized to `string.Empty`
 
 [R] CRITICAL — Do NOT:
     1. Accept or store any card data — no PAN, CVV, expiry, or name. This POC
@@ -1032,10 +1171,15 @@ PREFERRED — Do NOT:
 ## Prompt H1 — Wire AppHost project references ✏️
 
 ```text
-[S] Edit `src/OrderFlow.AppHost/OrderFlow.AppHost.csproj` to add ProjectReference
-    items for the five API csproj files now that they exist.
+[S] - Edit `src/OrderFlow.AppHost/OrderFlow.AppHost.csproj` to add ProjectReference
+      items for the five API csproj files now that they exist.
+    - Edit `src/OrderFlow.AppHost/Program.cs` to UNCOMMENT the five AddProject blocks
+      and the Angular `.WithEnvironment(...)`/`.WaitFor(...)` lines that depend on
+      them. Prompt A3 could not emit those live: the `Projects.*` types are SOURCE-
+      GENERATED from the ProjectReference items above, so they do not exist until this
+      step. They were written out in full and commented, so this is a pure uncomment.
 
-[C] Single-file edit. Keep existing PackageReference items unchanged.
+[C] Two-file edit. Keep existing PackageReference items unchanged.
 
 [R] CRITICAL — Do NOT:
     1. Add a ProjectReference to ServiceDefaults or Contracts from the AppHost — the
@@ -1043,8 +1187,11 @@ PREFERRED — Do NOT:
     2. Add a ProjectReference to OrderFlow.Web — it's an npm app, not a .NET project.
 
 [B] B-DOMINANT (Edit Mode):
-    - ONLY ADD the five ProjectReference lines.
-    - Do NOT modify any existing element in the csproj.
+    - In the csproj: ONLY ADD the five ProjectReference lines.
+    - In Program.cs: ONLY remove the leading `// ` from the already-written AddProject
+      and Angular env-var lines. Do NOT re-author them — if a line does not compile
+      once uncommented, say so rather than rewriting it.
+    - Do NOT modify any other existing element in either file.
     - Do NOT reformat unrelated lines.
     - All other project state must be byte-for-byte identical.
 ```
@@ -1128,7 +1275,7 @@ PREFERRED — Do NOT:
 ### I2 — "Output doesn't match our architecture"
 
 ```text
-[S] Compare `<path>` against `src/OrderFlow.Order.API/` for layering. Order is the
+[S] Compare `<path>` against `src/OrderFlow.Orders.API/` for layering. Order is the
     architectural reference.
 
 [C] Strict onion: Controller/Consumer → Facade → Business → Data → DbContext/Store.
