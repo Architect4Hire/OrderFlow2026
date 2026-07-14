@@ -17,10 +17,19 @@ var notificationProviderHangs = builder.AddParameter("notification-provider-hang
 // SQL Server — relational stores for Inventory (stock/reservations) and Payment.
 // Persistent volume + persistent container so stock levels survive a restart and
 // the concurrency demo has real data to contend over.
+//
+// NO PASSWORD PARAMETER, deliberately. Passing null lets Aspire generate a random
+// administrator password and persist it to USER SECRETS (the AppHost declares a
+// UserSecretsId), so it is stable across runs, unique per machine, and never enters the
+// repository. A fresh clone still comes up on `dotnet run` with no setup step.
+//
+// This replaces an explicit `AddParameter("sql-password", secret: true)` whose value was
+// supplied by a plaintext default in the committed appsettings.Development.json. That
+// honoured A3 [R]'s letter — the parameter WAS marked secret — while defeating its
+// purpose, because the secret sat in git. `secret: true` protects a value from being
+// logged; it does nothing about where you chose to write it down.
 // ─────────────────────────────────────────────────────────────────────────────
-var sqlPassword = builder.AddParameter("sql-password", secret: true);
-
-var sql = builder.AddSqlServer("sql", sqlPassword)
+var sql = builder.AddSqlServer("sql")
     .WithDataVolume("orderflow-sql-data")
     .WithLifetime(ContainerLifetime.Persistent);
 
@@ -77,24 +86,46 @@ serviceBus.AddServiceBusQueue("refund-payment").WithProperties(queue => queue.Ma
 serviceBus.AddServiceBusQueue("dispatch-fulfillment").WithProperties(queue => queue.MaxDeliveryCount = 4);
 
 // Events — reacting service → saga. The saga is the only subscriber.
-serviceBus.AddServiceBusTopic("inventory-reserved").AddServiceBusSubscription("order-saga");
-serviceBus.AddServiceBusTopic("inventory-rejected").AddServiceBusSubscription("order-saga");
-serviceBus.AddServiceBusTopic("payment-succeeded").AddServiceBusSubscription("order-saga");
-serviceBus.AddServiceBusTopic("fulfillment-dispatched").AddServiceBusSubscription("order-saga");
-serviceBus.AddServiceBusTopic("fulfillment-failed").AddServiceBusSubscription("order-saga");
+//
+// TWO names, and they are not the same thing. AddServiceBusSubscription(name, subscriptionName) takes an
+// ASPIRE RESOURCE name first — which is global across the entire app model, not scoped to its topic — and
+// the BROKER subscription name second. Passing one argument makes them identical, so five topics each
+// tried to register a resource literally called "order-saga" and the host threw on the second one before
+// a single container started. The consumers bind to the broker name, which must stay "order-saga" and
+// "notification"; only the resource name has to be unique, hence the "{topic}-{subscriber}" prefix.
+//
+// This never failed a build. It failed at startup, which is the only place it could have been caught.
+const string saga = "order-saga";
+const string notify = "notification";
 
-// PaymentDeclined has two subscribers: the saga compensates, Notification informs.
+serviceBus.AddServiceBusTopic("inventory-reserved").AddServiceBusSubscription("inventory-reserved-saga", saga);
+serviceBus.AddServiceBusTopic("inventory-rejected").AddServiceBusSubscription("inventory-rejected-saga", saga);
+serviceBus.AddServiceBusTopic("payment-succeeded").AddServiceBusSubscription("payment-succeeded-saga", saga);
+serviceBus.AddServiceBusTopic("fulfillment-dispatched").AddServiceBusSubscription("fulfillment-dispatched-saga", saga);
+serviceBus.AddServiceBusTopic("fulfillment-failed").AddServiceBusSubscription("fulfillment-failed-saga", saga);
+
+// PaymentDeclined has two subscribers: the saga compensates, Notification informs. This is the one topic
+// that proves the topic/subscription choice was worth making — a queue could not fan out to both.
 var paymentDeclined = serviceBus.AddServiceBusTopic("payment-declined");
-paymentDeclined.AddServiceBusSubscription("order-saga");
-paymentDeclined.AddServiceBusSubscription("notification");
+paymentDeclined.AddServiceBusSubscription("payment-declined-saga", saga);
+paymentDeclined.AddServiceBusSubscription("payment-declined-notification", notify);
 
 // Terminal events — Notification is a terminal subscriber. Nothing replies to these.
-serviceBus.AddServiceBusTopic("order-confirmed").AddServiceBusSubscription("notification");
-serviceBus.AddServiceBusTopic("order-failed").AddServiceBusSubscription("notification");
+serviceBus.AddServiceBusTopic("order-confirmed").AddServiceBusSubscription("order-confirmed-notification", notify);
+serviceBus.AddServiceBusTopic("order-failed").AddServiceBusSubscription("order-failed-notification", notify);
 
-// OrderPlaced is published for the audit trail. No service reacts to it today —
-// the saga starts by SENDING ReserveInventory, not by consuming this event.
-serviceBus.AddServiceBusTopic("order-placed");
+// There is deliberately NO "order-placed" topic.
+//
+// One used to be declared here, with a comment saying OrderPlaced was "published for the audit trail".
+// It was not published at all: OrderBusinessManager.PlaceAsync APPENDS OrderPlaced to the Cosmos event
+// log and then sends ReserveInventory. Nothing ever wrote to the topic and nothing ever subscribed to
+// it. The audit trail is the event log (ADR-002) — that was always the design; the topic was a
+// misremembering of it.
+//
+// Dead infrastructure is not free. **The Service Bus emulator refuses to start a topic that has zero
+// subscriptions** ("At least one subscription required per topic"), so this unused, unpublished,
+// unsubscribed topic segfaulted the broker on boot — and with the broker down, nothing in the system
+// works. It cost nothing to declare and took out the entire message bus.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // APIs — least privilege: each service gets ONLY the resources it uses.
@@ -132,20 +163,28 @@ builder.AddProject<Projects.OrderFlow_Notification_API>("notification-api")
     .WithExternalHttpEndpoints();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Angular — the customer status view and the ops view.
+// Angular — the customer status view and the ops view (Part G).
 //
-// TODO (Prompt G1): uncomment once src/OrderFlow.Web exists. AddJavaScriptApp resolves the
-// directory EAGERLY, so leaving this active before the workspace is scaffolded makes the AppHost
-// fail on startup — which is precisely what it did, silently, for the whole of Parts B–F: the
-// solution built green the entire time and the host could never once have started.
+// AddJavaScriptApp resolves its directory EAGERLY. While src/OrderFlow.Web did not exist, this line
+// made the AppHost throw on startup — so from Part B until Part G the solution built green every
+// time and the host could never once have started. A green build is not a running system.
+//
+// The port is pinned to 4200 rather than left to Aspire because every API's CORS policy whitelists
+// exactly one origin, http://localhost:4200 (B11 [R]1 — never a wildcard). A dynamically-assigned
+// port would serve the app from an origin the APIs refuse, and every call the browser made would be
+// blocked — a dead UI in front of five perfectly healthy services.
 // ─────────────────────────────────────────────────────────────────────────────
-// builder.AddJavaScriptApp("web", "../OrderFlow.Web", "start")
-//     .WithHttpEndpoint(port: 4200, env: "PORT")
-//     .WithEnvironment("ORDER_API_URL", orderApi.GetEndpoint("http"))
-//     .WithEnvironment("INVENTORY_API_URL", inventoryApi.GetEndpoint("http"))
-//     .WithEnvironment("PAYMENT_API_URL", paymentApi.GetEndpoint("http"))
-//     .WithEnvironment("FULFILLMENT_API_URL", fulfillmentApi.GetEndpoint("http"))
-//     .WaitFor(orderApi)
-//     .PublishAsDockerFile();
+builder.AddJavaScriptApp("web", "../OrderFlow.Web", "start")
+    .WithNpm()                                    // runs `npm install` before start, so a fresh clone
+                                                  // comes up with `dotnet run` and nothing else.
+    .WithHttpEndpoint(port: 4200, env: "PORT")
+    // The browser cannot read an environment variable. These reach it as a generated config.js —
+    // see OrderFlow.Web/scripts/write-config.mjs.
+    .WithEnvironment("ORDER_API_URL", orderApi.GetEndpoint("http"))
+    .WithEnvironment("INVENTORY_API_URL", inventoryApi.GetEndpoint("http"))
+    .WithEnvironment("PAYMENT_API_URL", paymentApi.GetEndpoint("http"))
+    .WithEnvironment("FULFILLMENT_API_URL", fulfillmentApi.GetEndpoint("http"))
+    .WaitFor(orderApi)
+    .PublishAsDockerFile();
 
 builder.Build().Run();
