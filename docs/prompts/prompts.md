@@ -810,11 +810,11 @@ PREFERRED — Do NOT:
 > Same onion layering as Order (B1→B11 minus the saga/read-model), different domain.
 > Below are the **deltas**. Inventory's whole reason to exist is proving no-oversell
 > under contention.
->
+> 
 > **Run Prompt B1 first**, substituting `OrderFlow.Inventory.API` (singular — no
 > `Inventory` entity, so no CS0118) and Inventory's package list. C1 assumes the
 > project already exists; there is no separate skeleton prompt for it.
->
+> 
 > **Open question, decide before C1.** `ReservationState` is `{ Held, Released }` and
 > the contracts have `ReserveInventory` / `ReleaseInventory` — but NOTHING tells
 > Inventory the goods shipped. On the happy path the hold stays `Held` forever and
@@ -1022,10 +1022,10 @@ PREFERRED — Do NOT:
 
 > Deltas from the Order template. Payment's reason to exist: idempotency against
 > duplicate callbacks, and clean decline handling.
->
+> 
 > **Run Prompt B1 first**, substituting `OrderFlow.Payments.API` (PLURAL — see B1 [C])
 > and Payment's package list. D1 assumes the project already exists.
->
+> 
 > Payment and Inventory look alike and are not. **Inventory guards a contended UPDATE
 > with a row version; Payment guards a contended INSERT with a unique index.** Payment
 > has no RowVersion, and that is a decision, not an omission — nothing updates a shared
@@ -1220,7 +1220,7 @@ PREFERRED — Do NOT:
 
 > Deltas. Fulfillment's reason to exist: resilient outbound calls to an unreliable
 > dependency, and clean dead-lettering on hard failure.
->
+> 
 > **Run Prompt B1 first**, substituting `OrderFlow.Fulfillment.API` (singular — no
 > colliding entity) and its package list: bus only, no EF/SQL, no Cosmos/Redis.
 > E1 assumes the project already exists.
@@ -1294,10 +1294,10 @@ PREFERRED — Do NOT:
 > The smallest service, and a deliberate one. Its job is to prove a boundary:
 > notification NEVER blocks or rolls back the order (see Services & Responsibilities,
 > and Open Question re: whether it stays a separate service).
->
+> 
 > **Run Prompt B1 first**, substituting `OrderFlow.Notification.API` (singular) and its
 > package list: bus only. F1 assumes the project already exists.
->
+> 
 > Notification is the one service that consumes TOPICS, not queues — so its consumers
 > derive from `ServiceBusConsumer<T>` (A5) with `SubscriptionName => "notification"`, the
 > subscription the AppHost declares on payment-declined, order-confirmed and order-failed.
