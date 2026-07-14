@@ -427,3 +427,62 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OrderFlow — additions beyond the stock VisualStudio.gitignore.
+#
+# The stock file is written for a .NET app. This is a .NET app + an Aspire host +
+# four emulated backing services + an Angular workspace, and each of those leaks a
+# file type the stock list has never heard of.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# TLS certificates and private keys.
+#
+# THE ONE MOST LIKELY TO BITE THIS REPO: the Cosmos DB emulator serves HTTPS with a
+# self-signed certificate, and the documented way to trust it is to EXPORT that cert to
+# disk — which people do, in the repo root, because that is where their shell was. A
+# committed .key is a committed private key whether or not it was "only the emulator's":
+# nobody reads the filename before they read the extension. *.pfx was already covered;
+# these were not.
+*.crt
+*.cer
+*.pem
+*.key
+*.p12
+*.jks
+
+# SSH / signing keys that wander in from a copy-paste.
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.ppk
+
+# Environment files. The stock list has `*.env`, which does NOT cover the names people
+# actually use — .env.local, .env.development. In a workspace with a Node app, these are
+# where API keys end up.
+.env
+.env.*
+!.env.example
+
+# Local configuration overrides. The convention is that anything named *.local.* is yours
+# alone and is exactly where a real connection string gets pasted "just to test something".
+appsettings.Local.json
+appsettings.*.Local.json
+local.settings.json
+secrets.json
+
+# Aspire publish/manifest output.
+.aspire/
+aspire-manifest.json
+aspire-output/
+
+# Angular. src/OrderFlow.Web/.gitignore covers these for that workspace; repeated here so a
+# second JS app cannot arrive without them.
+.angular/
+dist/
+out-tsc/
+
+# Container/emulator state, if anyone switches Aspire's named volumes to bind mounts.
+.data/
+.containers/
