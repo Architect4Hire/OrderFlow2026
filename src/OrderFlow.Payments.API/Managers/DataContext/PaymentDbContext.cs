@@ -20,9 +20,18 @@ public class PaymentDbContext(DbContextOptions<PaymentDbContext> options) : DbCo
 {
     public DbSet<Payment> Payments => Set<Payment>();
 
+    /// <summary>The durable idempotency store. See <see cref="SqlIdempotencyKeyStore"/>.</summary>
+    public DbSet<ProcessedMessage> ProcessedMessages => Set<ProcessedMessage>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
+
+        var processedMessage = modelBuilder.Entity<ProcessedMessage>();
+
+        processedMessage.ToTable("ProcessedMessages");
+        processedMessage.HasKey(item => new { item.ConsumerName, item.MessageId });
+        processedMessage.Property(item => item.ConsumerName).HasMaxLength(128);
 
         var payment = modelBuilder.Entity<Payment>();
 

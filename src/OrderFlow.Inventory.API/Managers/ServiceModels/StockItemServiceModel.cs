@@ -12,6 +12,9 @@ public class StockItemServiceModel
     /// <summary>Units in the warehouse.</summary>
     public int OnHand { get; set; }
 
+    /// <summary>The catalogue price. This is the number the customer gets charged (ADR-006).</summary>
+    public decimal UnitPrice { get; set; }
+
     /// <summary>Units held by in-flight orders.</summary>
     public int Reserved { get; set; }
 

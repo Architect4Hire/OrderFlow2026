@@ -1,14 +1,9 @@
-using System.Security.Cryptography;
-using System.Text;
-using System.Text.Json;
 using OrderFlow.Contracts.Messages;
 using OrderFlow.Orders.API.Managers.Data;
 using OrderFlow.Orders.API.Managers.DataContext;
 using OrderFlow.Orders.API.Managers.Domain;
 using OrderFlow.Orders.API.Managers.Extensions;
 using OrderFlow.ServiceDefaults.Messaging;
-
-using DomainLine = OrderFlow.Orders.API.Managers.Domain.OrderLine;
 
 namespace OrderFlow.Orders.API.Managers.Saga;
 
@@ -64,8 +59,6 @@ public sealed class OrderSaga(
     IMessageBus messageBus,
     ILogger<OrderSaga> logger) : IOrderSaga
 {
-    private static readonly JsonSerializerOptions PayloadOptions = new(JsonSerializerDefaults.Web);
-
     // ── Forward path ────────────────────────────────────────────────────────────────────────
 
     /// <summary>Inventory is held. Charge the customer.</summary>
@@ -78,6 +71,11 @@ public sealed class OrderSaga(
             return;
         }
 
+        // Inventory owns the catalogue, so Inventory priced the order. Stamp those prices on the
+        // aggregate BEFORE projecting it, or the read model shows a £0 order and — far worse — the
+        // ChargePayment below authorizes £0 (ADR-006).
+        OrderRehydrator.ApplyPricing(order, reserved);
+
         await ApplyAsync(order, reserved, OrderState.Reserved, cancellationToken).ConfigureAwait(false);
 
         var chargePayment = new ChargePayment
@@ -85,6 +83,8 @@ public sealed class OrderSaga(
             MessageId = DeterministicMessageId(order.Id, nameof(ChargePayment)),
             CorrelationId = order.Id,
             OccurredUtc = DateTime.UtcNow,
+
+            // The number Inventory gave us. Never a number the customer sent.
             Amount = order.Total,
 
             // Stable across every retry of this handler, so a redelivered InventoryReserved can
@@ -130,6 +130,22 @@ public sealed class OrderSaga(
         }
 
         await ApplyAsync(order, dispatched, OrderState.Dispatched, cancellationToken).ConfigureAwait(false);
+
+        // The goods left the building, so the holds must stop being holds. Without this the
+        // reservation stays Held forever and OnHand never falls: the warehouse row permanently
+        // overstates the shelf, and the ops view cannot tell a hold that SHIPPED from a hold that is
+        // STRANDED by a lost compensation. Telling those two apart is the whole point of the system.
+        //
+        // Sent alongside the confirm, not instead of a step — the same shape as OnFulfillmentFailed
+        // issuing both a refund and a release. Still one event in, one decision out.
+        var commitInventory = new CommitInventory
+        {
+            MessageId = DeterministicMessageId(order.Id, nameof(CommitInventory)),
+            CorrelationId = order.Id,
+            OccurredUtc = DateTime.UtcNow
+        };
+
+        await messageBus.SendCommandAsync(commitInventory, cancellationToken).ConfigureAwait(false);
 
         var confirmed = new OrderConfirmed
         {
@@ -298,7 +314,10 @@ public sealed class OrderSaga(
     {
         var stream = await eventStore.ReadStreamAsync(orderId, cancellationToken).ConfigureAwait(false);
 
-        var order = Rehydrate(orderId, stream);
+        // Shared with the projection rebuild (OrderProjectionRebuilder). One definition of what an
+        // order's history means — two would eventually disagree, and the ops view would confidently
+        // report a state the saga does not believe in.
+        var order = OrderRehydrator.Rehydrate(orderId, stream);
 
         if (order is null)
         {
@@ -309,7 +328,7 @@ public sealed class OrderSaga(
                 $"Received {trigger} for order {orderId}, which has no event stream.");
         }
 
-        if (order.State is OrderState.Confirmed or OrderState.Failed)
+        if (OrderRehydrator.IsTerminal(order.State))
         {
             // THE terminal guard. A redelivered event on a finished order does nothing — no second
             // refund, no second release, no second email.
@@ -322,121 +341,17 @@ public sealed class OrderSaga(
         return order;
     }
 
-    /// <summary>
-    /// Folds the event stream into the aggregate. Idempotent by construction — applying the same
-    /// event twice sets the same state twice — so a duplicate append (which a replayed handler can
-    /// produce) cannot corrupt the result.
-    /// </summary>
-    /// <remarks>
-    /// Only OrderConfirmed and OrderFailed are terminal. InventoryRejected, PaymentDeclined and
-    /// FulfillmentFailed record the REASON but leave the state alone: they are the cause, not the
-    /// conclusion, and the handler still has compensations to send. Making them terminal here would
-    /// re-introduce the stranded-stock bug through the back door.
-    /// </remarks>
-    private static Order? Rehydrate(Guid orderId, IReadOnlyList<OrderEventEnvelope> stream)
-    {
-        Order? order = null;
-
-        foreach (var envelope in stream)
-        {
-            switch (envelope.Type)
-            {
-                case nameof(OrderPlaced):
-                    order = FromPlaced(orderId, envelope.Payload.Deserialize<OrderPlaced>(PayloadOptions)!);
-                    break;
-
-                case nameof(InventoryReserved):
-                    Advance(order, OrderState.Reserved);
-                    break;
-
-                case nameof(PaymentSucceeded):
-                    Advance(order, OrderState.Paid);
-                    break;
-
-                case nameof(FulfillmentDispatched):
-                    Advance(order, OrderState.Dispatched);
-                    break;
-
-                case nameof(OrderConfirmed):
-                    Advance(order, OrderState.Confirmed);
-                    break;
-
-                case nameof(OrderFailed):
-                    Advance(order, OrderState.Failed);
-                    RecordReason(order, envelope.Payload.Deserialize<OrderFailed>(PayloadOptions)!.Reason);
-                    break;
-
-                case nameof(InventoryRejected):
-                    RecordReason(order, envelope.Payload.Deserialize<InventoryRejected>(PayloadOptions)!.Reason);
-                    break;
-
-                case nameof(PaymentDeclined):
-                    RecordReason(order, envelope.Payload.Deserialize<PaymentDeclined>(PayloadOptions)!.Reason);
-                    break;
-
-                case nameof(FulfillmentFailed):
-                    RecordReason(order, envelope.Payload.Deserialize<FulfillmentFailed>(PayloadOptions)!.Reason);
-                    break;
-            }
-
-            if (order is not null)
-            {
-                order.UpdatedUtc = envelope.OccurredUtc;
-            }
-        }
-
-        return order;
-    }
-
-    private static Order FromPlaced(Guid orderId, OrderPlaced placed) => new()
-    {
-        Id = orderId,
-        CustomerRef = placed.CustomerRef,
-        State = OrderState.Placed,
-        Subtotal = placed.Total,
-        Total = placed.Total,
-        FailureReason = string.Empty,
-        CreatedUtc = placed.OccurredUtc,
-        UpdatedUtc = placed.OccurredUtc,
-        Lines = placed.Lines
-            .Select((line, index) => new DomainLine
-            {
-                // OrderPlaced does not carry line ids, so they cannot be restored — only derived.
-                // Deterministic from (order, position) so at least they are STABLE across every
-                // rehydration, rather than churning on each poll of the status view.
-                Id = DeterministicMessageId(orderId, $"line:{index}:{line.Sku}"),
-                OrderId = orderId,
-                Sku = line.Sku,
-                Quantity = line.Quantity,
-                UnitPrice = line.UnitPrice
-            })
-            .ToList()
-    };
-
-    private static void Advance(Order? order, OrderState state)
-    {
-        if (order is not null)
-        {
-            order.State = state;
-        }
-    }
-
-    private static void RecordReason(Order? order, string reason)
-    {
-        if (order is not null)
-        {
-            order.FailureReason = reason;
-        }
-    }
 
     /// <summary>
     /// Same (order, message type) always yields the same MessageId, so a replayed handler re-sends
     /// a message the receiver has already processed and its idempotency guard discards it.
     /// </summary>
-    private static Guid DeterministicMessageId(Guid orderId, string discriminator)
-    {
-        var hash = SHA256.HashData(Encoding.UTF8.GetBytes($"{orderId:N}:{discriminator}"));
-
-        return new Guid(hash.AsSpan(0, 16));
-    }
+    /// <remarks>
+    /// Delegates to the shared convention rather than re-implementing the hash. The recovery sweeper
+    /// re-sends the very same commands this saga does, and if the two derived ids by even slightly
+    /// different means, every re-drive would look like a brand-new message to the receiver and charge
+    /// the customer twice.
+    /// </remarks>
+    private static Guid DeterministicMessageId(Guid orderId, string discriminator) =>
+        MessagingConventions.DeterministicMessageId(orderId, discriminator);
 }

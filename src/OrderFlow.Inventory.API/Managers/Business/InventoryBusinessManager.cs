@@ -2,6 +2,11 @@ using OrderFlow.Inventory.API.Managers.Data;
 using OrderFlow.Inventory.API.Managers.Extensions;
 using OrderFlow.Inventory.API.Managers.ServiceModels;
 
+// The priced lines travel back to the saga on InventoryReserved, so the wire shape is the right one
+// to hand back from Business — mapping it to a private type and straight out again would be
+// ceremony.
+using ContractLine = OrderFlow.Contracts.Messages.OrderLine;
+
 namespace OrderFlow.Inventory.API.Managers.Business;
 
 /// <summary>
@@ -9,11 +14,16 @@ namespace OrderFlow.Inventory.API.Managers.Business;
 /// "we do not have the stock" is the system working correctly, and the saga has a first-class path
 /// for it.
 /// </summary>
-public sealed record ReservationResult(bool Success, string Reason)
+public sealed record ReservationResult(
+    bool Success,
+    string Reason,
+    IReadOnlyList<ContractLine> PricedLines,
+    decimal Total)
 {
-    public static ReservationResult Reserved() => new(true, string.Empty);
+    public static ReservationResult Reserved(IReadOnlyList<ContractLine> pricedLines, decimal total) =>
+        new(true, string.Empty, pricedLines, total);
 
-    public static ReservationResult Rejected(string reason) => new(false, reason);
+    public static ReservationResult Rejected(string reason) => new(false, reason, [], 0m);
 }
 
 public interface IInventoryBusinessManager
@@ -24,6 +34,9 @@ public interface IInventoryBusinessManager
         CancellationToken cancellationToken = default);
 
     Task ReleaseAsync(Guid orderId, CancellationToken cancellationToken = default);
+
+    /// <summary>The goods shipped. Turn this order's holds into a permanent stock decrement.</summary>
+    Task CommitAsync(Guid orderId, CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<StockItemServiceModel>> ListStockAsync(CancellationToken cancellationToken = default);
 
@@ -80,6 +93,8 @@ public class InventoryBusinessManager(IInventoryData data, ILogger<InventoryBusi
                 orderId, abandoned);
         }
 
+        var pricedLines = new List<ContractLine>(lines.Count);
+
         foreach (var (sku, quantity) in lines)
         {
             if (quantity <= 0)
@@ -87,14 +102,24 @@ public class InventoryBusinessManager(IInventoryData data, ILogger<InventoryBusi
                 return await RejectAsync(orderId, $"Line '{sku}' has a non-positive quantity of {quantity}.", cancellationToken);
             }
 
-            var outcome = await data.TryHoldAsync(orderId, sku, quantity, cancellationToken);
+            var hold = await data.TryHoldAsync(orderId, sku, quantity, cancellationToken);
 
-            if (outcome == HoldOutcome.Held)
+            if (hold.Outcome == HoldOutcome.Held)
             {
+                // The price comes off the StockItem we just held, so it is the catalogue's answer at
+                // the moment of reservation — not a number the customer sent, and not a number that
+                // could have drifted between the browser and here (ADR-006).
+                pricedLines.Add(new ContractLine
+                {
+                    Sku = sku,
+                    Quantity = quantity,
+                    UnitPrice = hold.UnitPrice
+                });
+
                 continue;
             }
 
-            var reason = outcome switch
+            var reason = hold.Outcome switch
             {
                 HoldOutcome.InsufficientStock => $"Insufficient stock for SKU '{sku}': {quantity} requested.",
                 HoldOutcome.UnknownSku => $"Unknown SKU '{sku}'.",
@@ -105,9 +130,15 @@ public class InventoryBusinessManager(IInventoryData data, ILogger<InventoryBusi
             return await RejectAsync(orderId, reason, cancellationToken);
         }
 
-        logger.LogInformation("Reserved {LineCount} line(s) for order {OrderId}.", lines.Count, orderId);
+        // Rounded once, here, at the boundary where the total leaves this service ([R]4 of D2 —
+        // same rule, same reason).
+        var total = decimal.Round(
+            pricedLines.Sum(line => line.Quantity * line.UnitPrice), 2, MidpointRounding.AwayFromZero);
 
-        return ReservationResult.Reserved();
+        logger.LogInformation(
+            "Reserved {LineCount} line(s) for order {OrderId}, priced at {Total}.", lines.Count, orderId, total);
+
+        return ReservationResult.Reserved(pricedLines, total);
     }
 
     /// <summary>
@@ -130,6 +161,18 @@ public class InventoryBusinessManager(IInventoryData data, ILogger<InventoryBusi
         var released = await data.ReleaseAsync(orderId, cancellationToken);
 
         logger.LogInformation("Release for order {OrderId} gave back {Count} reservation(s).", orderId, released);
+    }
+
+    /// <summary>
+    /// The goods shipped. Idempotent for the same reason Release is: it only looks at HELD
+    /// reservations, so committing an order that has already been committed — or released, or never
+    /// reserved — finds nothing and quietly does nothing.
+    /// </summary>
+    public async Task CommitAsync(Guid orderId, CancellationToken cancellationToken = default)
+    {
+        var consumed = await data.CommitAsync(orderId, cancellationToken);
+
+        logger.LogInformation("Commit for order {OrderId} consumed {Count} reservation(s).", orderId, consumed);
     }
 
     public async Task<IReadOnlyList<StockItemServiceModel>> ListStockAsync(CancellationToken cancellationToken = default) =>

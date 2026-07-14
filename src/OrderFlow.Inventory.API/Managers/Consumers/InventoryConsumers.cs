@@ -63,7 +63,13 @@ public sealed class ReserveInventoryConsumer(
                 new InventoryReserved
                 {
                     MessageId = MessagingConventions.DeterministicMessageId(command.CorrelationId, nameof(InventoryReserved)),
-                    CorrelationId = command.CorrelationId
+                    CorrelationId = command.CorrelationId,
+
+                    // The catalogue's prices, travelling back to the saga. This is the ONLY place a
+                    // price enters the workflow, and it is the number the customer will be charged
+                    // (ADR-006).
+                    Lines = result.PricedLines,
+                    Total = result.Total
                 },
                 cancellationToken);
 
@@ -107,12 +113,37 @@ public sealed class ReleaseInventoryConsumer(
     }
 }
 
+/// <summary>
+/// commit-inventory → the goods shipped, so the holds become a permanent decrement. No reply.
+/// </summary>
+/// <remarks>
+/// The mirror image of release, and the message that finally closes the happy path. Committing an
+/// order with no live holds is a no-op, so a redelivery is safe — exactly like the compensations.
+/// </remarks>
+public sealed class CommitInventoryConsumer(
+    ServiceBusClient client,
+    IServiceScopeFactory scopeFactory,
+    ILogger<CommitInventoryConsumer> logger)
+    : ServiceBusConsumer<CommitInventory>(client, scopeFactory, logger)
+{
+    protected override async Task HandleAsync(
+        IServiceProvider services,
+        CommitInventory command,
+        CancellationToken cancellationToken)
+    {
+        var business = services.GetRequiredService<IInventoryBusinessManager>();
+
+        await business.CommitAsync(command.CorrelationId, cancellationToken);
+    }
+}
+
 public static class InventoryConsumerExtensions
 {
     public static IHostApplicationBuilder AddInventoryConsumers(this IHostApplicationBuilder builder)
     {
         builder.Services.AddHostedService<ReserveInventoryConsumer>();
         builder.Services.AddHostedService<ReleaseInventoryConsumer>();
+        builder.Services.AddHostedService<CommitInventoryConsumer>();
 
         return builder;
     }

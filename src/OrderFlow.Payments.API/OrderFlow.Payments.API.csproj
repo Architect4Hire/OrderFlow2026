@@ -24,6 +24,10 @@
     <!-- Scalar renders an OpenAPI document; it does not produce one. In .NET 10 the generator
          ships as a package, not in the shared framework, so Scalar alone gives a blank page. -->
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.9" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.7">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
 
     <!-- Pinned above the 2.0.0 that Microsoft.AspNetCore.OpenApi drags in transitively: that
          version carries GHSA-v5pm-xwqc-g5wc (high — circular schema references terminate OpenAPI

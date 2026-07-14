@@ -15,7 +15,11 @@ builder.AddServiceDefaults();
 // Registered before the consumers, which start pulling the moment the host starts. SQL and Service
 // Bus only — Payment has no business knowing that Cosmos or Redis exist.
 builder.AddPaymentDataContext();  // SQL "PaymentDb"
-builder.AddOrderFlowMessaging();  // Service Bus "servicebus" + the idempotency store
+
+// DURABLE idempotency, backed by this service's own database. Note this is Payment's SECOND guard
+// and the weaker one — the unique index on Payment.IdempotencyKey is what actually protects the
+// customer's money. See SqlIdempotencyKeyStore.
+builder.AddOrderFlowMessaging<SqlIdempotencyKeyStore>();
 
 // ── The onion ───────────────────────────────────────────────────────────────────────────────────
 builder.AddPaymentData();

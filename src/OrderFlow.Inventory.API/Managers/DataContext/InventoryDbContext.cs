@@ -20,9 +20,21 @@ public class InventoryDbContext(DbContextOptions<InventoryDbContext> options) : 
 
     public DbSet<Reservation> Reservations => Set<Reservation>();
 
+    /// <summary>The durable idempotency store. See <see cref="SqlIdempotencyKeyStore"/>.</summary>
+    public DbSet<ProcessedMessage> ProcessedMessages => Set<ProcessedMessage>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
+
+        var processedMessage = modelBuilder.Entity<ProcessedMessage>();
+
+        processedMessage.ToTable("ProcessedMessages");
+
+        // The composite key IS the guard: (ConsumerName, MessageId). Two concurrent redeliveries can
+        // both read "not processed"; only one of them can insert.
+        processedMessage.HasKey(item => new { item.ConsumerName, item.MessageId });
+        processedMessage.Property(item => item.ConsumerName).HasMaxLength(128);
 
         var stockItem = modelBuilder.Entity<StockItem>();
 
@@ -32,6 +44,11 @@ public class InventoryDbContext(DbContextOptions<InventoryDbContext> options) : 
         // id would be a second identity for the same thing and a join for no reason.
         stockItem.HasKey(item => item.Sku);
         stockItem.Property(item => item.Sku).HasMaxLength(64);
+
+        // Money is decimal(18,2) explicitly. Left to convention EF picks a default precision and
+        // silently truncates the scale it does not expect — and this is the number the customer is
+        // charged.
+        stockItem.Property(item => item.UnitPrice).HasPrecision(18, 2);
 
         // ── The load-bearing line ────────────────────────────────────────────────────────────────
         // SQL Server stamps a fresh 8-byte value on every UPDATE; EF carries the loaded value into

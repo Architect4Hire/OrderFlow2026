@@ -20,15 +20,29 @@ builder.AddServiceDefaults();
 // that is silently fatal if dropped — above all the Cosmos camelCase serializer, without which
 // every append fails on a partition-key mismatch. That is exactly why they are extensions and
 // not three loose Aspire calls here.
-builder.AddOrderEventStore();     // Cosmos container "order-events", partitioned by /orderId
-builder.AddOrderReadModel();      // Redis "redis"
-builder.AddOrderFlowMessaging();  // Service Bus "servicebus" + the idempotency store
+builder.AddOrderEventStore();            // Cosmos container "order-events", partitioned by /orderId
+builder.AddCosmosIdempotencyKeyStore();  // Cosmos container "processed-messages", by /consumerName
+builder.AddOrderReadModel();             // Redis "redis"
+
+// AddCosmosIdempotencyKeyStore above has already registered the DURABLE store, so the in-memory
+// fallback inside AddOrderFlowMessaging (a TryAdd) does not take. The in-memory one forgets every
+// processed message on restart, which would make "at-least-once delivery is safe here" true only
+// until the next deploy.
+builder.AddOrderFlowMessaging();
 
 // ── The onion ───────────────────────────────────────────────────────────────────────────────
 // Controller → Facade → Business → (event store | read model | bus), with the saga alongside.
 builder.Services.AddScoped<IOrderBusinessManager, OrderBusinessManager>();
 builder.Services.AddScoped<IOrderFacade, OrderFacade>();
 builder.Services.AddScoped<IOrderSaga, OrderSaga>();
+
+// The stuck-order sweeper. The only thing in the system that can rescue an order whose opening
+// command was never sent — see OrderRecoveryManager.
+builder.AddOrderRecovery();
+
+// The ops surface: order timelines, the system-wide dead-letter view, and the projection rebuild
+// that makes ADR-003's "Redis is rebuildable" claim true rather than aspirational.
+builder.AddOrderOps();
 
 // Six hosted processors, one per event the saga reacts to. Registered last: they are the only
 // thing here that starts doing work on its own.

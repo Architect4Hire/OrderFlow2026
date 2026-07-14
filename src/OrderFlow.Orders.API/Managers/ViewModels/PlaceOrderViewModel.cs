@@ -18,7 +18,17 @@ public class PlaceOrderViewModel
     public List<OrderLineViewModel> Lines { get; set; } = [];
 }
 
-/// <summary>A requested line. Validation lives here, never on the Domain entity.</summary>
+/// <summary>
+/// A requested line: a SKU and a quantity. Validation lives here, never on the Domain entity.
+/// </summary>
+/// <remarks>
+/// <b>There is no UnitPrice, and its absence is the security control.</b> It used to be here, and it
+/// meant the caller set the price — and therefore Subtotal, Total, and the amount ChargePayment
+/// authorized. A customer could buy a laptop for a penny by editing one field of the JSON they were
+/// already sending, and nothing downstream would have blinked, because every service faithfully
+/// carried the number it was given. Prices now come from Inventory, which owns the catalogue, and
+/// arrive on InventoryReserved (ADR-006). A field that does not exist cannot be forged.
+/// </remarks>
 public class OrderLineViewModel
 {
     [Required]
@@ -26,13 +36,4 @@ public class OrderLineViewModel
 
     [Range(1, 100)]
     public int Quantity { get; set; }
-
-    // TODO: the server should price the line from the SKU, not trust the client's UnitPrice.
-    // As it stands the caller sets the price, so the caller sets Subtotal, Total, and therefore
-    // the amount ChargePayment authorizes. Fine for a POC; a real system looks the price up.
-    //
-    // The decimal-typed Range overload is deliberate: the (double, double) one round-trips money
-    // through binary floating point and can misjudge a boundary value like 99999.99.
-    [Range(typeof(decimal), "0.0", "99999.99", ParseLimitsInInvariantCulture = true)]
-    public decimal UnitPrice { get; set; }
 }

@@ -37,14 +37,15 @@ public sealed class OrderBusinessManager(
 
         // CorrelationId IS the OrderId, set once here and never regenerated. Every message this
         // order ever produces — across all five services, forward and compensating — carries it.
+        // No Total: a placed order is not yet priced. Inventory owns the catalogue and has not
+        // answered yet (ADR-006).
         var orderPlaced = new OrderPlaced
         {
-            MessageId = Guid.NewGuid(),
+            MessageId = MessagingConventions.DeterministicMessageId(order.Id, nameof(OrderPlaced)),
             CorrelationId = order.Id,
             OccurredUtc = order.CreatedUtc,
             CustomerRef = order.CustomerRef,
-            Lines = order.Lines.ToMessageLines(),
-            Total = order.Total
+            Lines = order.Lines.ToMessageLines()
         };
 
         // Append BEFORE sending, deliberately. If the append fails we have sent nothing and the
@@ -56,16 +57,25 @@ public sealed class OrderBusinessManager(
 
         await readModel.SetStatusAsync(serviceModel, cancellationToken).ConfigureAwait(false);
 
-        // TODO: outbox. The append and the send are two writes with no transaction between them —
-        // if the send throws, the order sits at Placed with no saga running: a stuck order, which
-        // is exactly what the ops view exists to surface. A real system writes the command to an
-        // outbox in the same transaction as the append and dispatches it separately.
+        // The append and the send are still two writes with no transaction between them: if the send
+        // throws, the order sits at Placed with nothing listening. What has changed is that this is
+        // no longer PERMANENT — OrderRecoveryManager sweeps for orders that have stopped moving and
+        // re-sends the command for their current state. That is not an outbox (a real system writes
+        // the command in the same transaction as the append and dispatches it separately), but it
+        // does mean a failed send is a delay rather than a lost order.
+        //
+        // The deterministic MessageId is what makes that safe: this is the same id the sweeper will
+        // use, so if the send DID get through, the redelivery is deduped by Inventory's guard rather
+        // than reserving the stock twice. Every other message in the system already worked this way;
+        // this one — the command that starts the whole saga — was the last hold-out.
         //
         // This is also the ONE piece of orchestration outside the saga: that the first step of a
         // placed order is to reserve inventory. See the note in [R]2 below.
         var reserveInventory = new ReserveInventory
         {
+            MessageId = MessagingConventions.DeterministicMessageId(order.Id, nameof(ReserveInventory)),
             CorrelationId = order.Id,
+            OccurredUtc = order.CreatedUtc,
             Lines = order.Lines.ToMessageLines()
         };
 

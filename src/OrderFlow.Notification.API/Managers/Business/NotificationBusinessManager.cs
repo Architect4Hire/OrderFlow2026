@@ -53,6 +53,16 @@ public interface INotificationBusinessManager
 /// subscription's handler open indefinitely, and every subsequent notification would queue up behind
 /// it — the slow dependency taking the service down without ever returning an error.
 /// </para>
+/// <para>
+/// <b>But the timeout is a CONTRACT, not a guarantee, and the provider has to keep its half.</b> Polly
+/// times out by cancelling the CancellationToken; it cannot abandon a Task that ignores one. A
+/// provider that blocks without observing cancellation — a synchronous SMTP client, say, or an SDK
+/// that takes no token — cannot be timed out by this pipeline at all, and the handler will sit and
+/// wait for it exactly as if the timeout were not there. <see cref="SimulatedNotificationProvider"/>
+/// threads the token through for that reason. Anything real that replaces it must do the same, or be
+/// wrapped in something that can genuinely abandon it. The unit test for this caught the mistake by
+/// running for the full thirty seconds.
+/// </para>
 /// </remarks>
 public class NotificationBusinessManager(
     ResiliencePipelineProvider<string> pipelineProvider,

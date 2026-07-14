@@ -1,7 +1,7 @@
 using OrderFlow.Fulfillment.API.Managers.Business;
 using OrderFlow.Fulfillment.API.Managers.Consumers;
-using OrderFlow.Fulfillment.API.Managers.Data;
 using OrderFlow.Fulfillment.API.Managers.Facades;
+using OrderFlow.ServiceDefaults.Messaging;
 using Scalar.AspNetCore;
 
 const string WebCorsPolicy = "WebCors";
@@ -17,7 +17,7 @@ builder.AddOrderFlowMessaging();  // Service Bus "servicebus" + the idempotency 
 
 // ── The onion ───────────────────────────────────────────────────────────────────────────────────
 builder.AddCarrierClient();       // Polly pipeline + the simulator, tuned for this dependency
-builder.AddFulfillmentData();     // dead-letter reader
+builder.AddDeadLetterBrowser();   // shared with every other service
 builder.AddFulfillmentBusiness();
 builder.AddFulfillmentFacade();
 

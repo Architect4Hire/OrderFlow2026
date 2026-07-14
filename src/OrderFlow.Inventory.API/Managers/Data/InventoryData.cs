@@ -24,19 +24,39 @@ public enum HoldOutcome
     ConcurrencyExhausted = 3
 }
 
+/// <summary>
+/// The outcome of one line's hold, plus the CATALOGUE PRICE of the SKU.
+/// </summary>
+/// <remarks>
+/// The price rides back on the hold because this is the moment we have the StockItem row in hand. It
+/// is the authoritative number the saga will charge — the customer never sends one (ADR-006).
+/// </remarks>
+public sealed record HoldResult(HoldOutcome Outcome, decimal UnitPrice)
+{
+    public static HoldResult Held(decimal unitPrice) => new(HoldOutcome.Held, unitPrice);
+
+    public static HoldResult Rejected(HoldOutcome outcome) => new(outcome, 0m);
+}
+
 public interface IInventoryData
 {
     /// <summary>
     /// Take one line's hold: increment Reserved if Available covers it, and write the Reservation
-    /// row that records the hold — in a single transaction.
+    /// row that records the hold — in a single transaction. Returns the catalogue price on success.
     /// </summary>
-    Task<HoldOutcome> TryHoldAsync(Guid orderId, string sku, int quantity, CancellationToken cancellationToken = default);
+    Task<HoldResult> TryHoldAsync(Guid orderId, string sku, int quantity, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Give back every hold this order is carrying. Returns how many reservations were released;
     /// zero is a valid, expected answer.
     /// </summary>
     Task<int> ReleaseAsync(Guid orderId, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// The goods shipped: turn this order's holds into a permanent decrement. Returns how many
+    /// reservations were consumed; zero is a valid, expected answer.
+    /// </summary>
+    Task<int> CommitAsync(Guid orderId, CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<StockItem>> ListStockAsync(CancellationToken cancellationToken = default);
 
@@ -58,7 +78,7 @@ public class InventoryData(InventoryDbContext context, ILogger<InventoryData> lo
     /// <summary>Bounded ([R]4). Three losses in a row means real contention, not a blip.</summary>
     private const int MaxConcurrencyAttempts = 3;
 
-    public async Task<HoldOutcome> TryHoldAsync(
+    public async Task<HoldResult> TryHoldAsync(
         Guid orderId,
         string sku,
         int quantity,
@@ -71,7 +91,7 @@ public class InventoryData(InventoryDbContext context, ILogger<InventoryData> lo
 
             if (stockItem is null)
             {
-                return HoldOutcome.UnknownSku;
+                return HoldResult.Rejected(HoldOutcome.UnknownSku);
             }
 
             // The check happens on values we loaded, so by the time we write they may be stale —
@@ -79,7 +99,7 @@ public class InventoryData(InventoryDbContext context, ILogger<InventoryData> lo
             // TOCTOU bug that the database is about to catch.
             if (stockItem.Available < quantity)
             {
-                return HoldOutcome.InsufficientStock;
+                return HoldResult.Rejected(HoldOutcome.InsufficientStock);
             }
 
             stockItem.Reserved += quantity;
@@ -106,7 +126,7 @@ public class InventoryData(InventoryDbContext context, ILogger<InventoryData> lo
                 // INSERT INTO Reservations ...
                 await context.SaveChangesAsync(cancellationToken);
 
-                return HoldOutcome.Held;
+                return HoldResult.Held(stockItem.UnitPrice);
             }
             catch (DbUpdateConcurrencyException)
             {
@@ -129,10 +149,30 @@ public class InventoryData(InventoryDbContext context, ILogger<InventoryData> lo
             "Gave up holding {Quantity} of {Sku} for order {OrderId} after {MaxAttempts} concurrency conflicts.",
             quantity, sku, orderId, MaxConcurrencyAttempts);
 
-        return HoldOutcome.ConcurrencyExhausted;
+        return HoldResult.Rejected(HoldOutcome.ConcurrencyExhausted);
     }
 
-    public async Task<int> ReleaseAsync(Guid orderId, CancellationToken cancellationToken = default)
+    public Task<int> ReleaseAsync(Guid orderId, CancellationToken cancellationToken = default) =>
+        SettleAsync(orderId, ReservationState.Released, cancellationToken);
+
+    public Task<int> CommitAsync(Guid orderId, CancellationToken cancellationToken = default) =>
+        SettleAsync(orderId, ReservationState.Consumed, cancellationToken);
+
+    /// <summary>
+    /// Both endings of a hold, which are the same operation with one difference.
+    /// </summary>
+    /// <remarks>
+    /// <b>Release</b> gives the stock back: Reserved falls, OnHand does not — the goods are still on
+    /// the shelf. <b>Commit</b> takes the stock away for good: Reserved AND OnHand both fall, because
+    /// the goods have left the building. <c>Available</c> is unchanged by a commit, which is exactly
+    /// right: the stock was already spoken for, and now it is simply gone.
+    /// <para>
+    /// They share this method because they share the invariant that matters — the stock level and the
+    /// reservation's fate move in ONE transaction. Write them separately and a crash in between
+    /// either gives stock back twice or loses it entirely.
+    /// </para>
+    /// </remarks>
+    private async Task<int> SettleAsync(Guid orderId, ReservationState target, CancellationToken cancellationToken)
     {
         var held = await context.Reservations
             .Where(item => item.OrderId == orderId && item.State == ReservationState.Held)
@@ -140,34 +180,36 @@ public class InventoryData(InventoryDbContext context, ILogger<InventoryData> lo
 
         if (held.Count == 0)
         {
-            // The redelivered-ReleaseInventory case, and the never-reserved case. Both are no-ops,
-            // which is what makes this command safe to send more than once.
+            // The redelivered-compensation case, the redelivered-commit case, and the never-reserved
+            // case. All no-ops, which is what makes these commands safe to send more than once.
             return 0;
         }
 
-        var released = 0;
+        var settled = 0;
 
-        // One SKU at a time: the decrement and the tombstones for that SKU commit together, so a
-        // crash mid-release can never leave stock given back with the reservations still marked
+        // One SKU at a time: the stock move and the tombstones for that SKU commit together, so a
+        // crash mid-settle can never leave stock given back with the reservations still marked
         // Held — which would let the next redelivery give the same stock back a second time.
         foreach (var group in held.GroupBy(item => item.Sku))
         {
-            if (await ReleaseSkuAsync(orderId, group.Key, [.. group], cancellationToken))
+            if (await SettleSkuAsync(orderId, group.Key, [.. group], target, cancellationToken))
             {
-                released += group.Count();
+                settled += group.Count();
             }
         }
 
-        return released;
+        return settled;
     }
 
-    private async Task<bool> ReleaseSkuAsync(
+    private async Task<bool> SettleSkuAsync(
         Guid orderId,
         string sku,
         IReadOnlyList<Reservation> reservations,
+        ReservationState target,
         CancellationToken cancellationToken)
     {
         var quantity = reservations.Sum(item => item.Quantity);
+        var consuming = target == ReservationState.Consumed;
 
         for (var attempt = 1; attempt <= MaxConcurrencyAttempts; attempt++)
         {
@@ -176,14 +218,14 @@ public class InventoryData(InventoryDbContext context, ILogger<InventoryData> lo
 
             if (stockItem is null)
             {
-                // A reservation against a SKU that no longer exists. Nothing to give back, but the
-                // hold must still be tombstoned or it stays "Held" forever and the ops view reads it
-                // as stranded stock.
+                // A reservation against a SKU that no longer exists. Nothing to move, but the hold
+                // must still be tombstoned or it stays "Held" forever and the ops view reads it as
+                // stranded stock.
                 logger.LogError(
-                    "Order {OrderId} holds {Quantity} of unknown SKU {Sku}. Tombstoning the reservations; stock cannot be restored.",
-                    orderId, quantity, sku);
+                    "Order {OrderId} holds {Quantity} of unknown SKU {Sku}. Tombstoning as {Target}; stock cannot be adjusted.",
+                    orderId, quantity, sku, target);
 
-                MarkReleased(reservations);
+                MarkAs(reservations, target);
 
                 await context.SaveChangesAsync(cancellationToken);
 
@@ -192,32 +234,39 @@ public class InventoryData(InventoryDbContext context, ILogger<InventoryData> lo
 
             if (stockItem.Reserved < quantity)
             {
-                // Invariant broken: we are about to give back more than the SKU thinks is held.
-                // Clamp rather than drive Reserved negative ([R]3 — Available must never exceed
-                // OnHand), and shout, because this means a hold was released twice somewhere.
+                // Invariant broken: we are about to settle more than the SKU thinks is held. Clamp
+                // rather than drive Reserved negative ([R]3 — Available must never exceed OnHand),
+                // and shout, because this means a hold was settled twice somewhere.
                 logger.LogError(
-                    "Order {OrderId} is releasing {Quantity} of {Sku} but only {Reserved} is held. Clamping to zero.",
+                    "Order {OrderId} is settling {Quantity} of {Sku} but only {Reserved} is held. Clamping to zero.",
                     orderId, quantity, sku, stockItem.Reserved);
             }
 
             stockItem.Reserved = Math.Max(0, stockItem.Reserved - quantity);
+
+            if (consuming)
+            {
+                // The goods shipped. They are no longer on the shelf.
+                stockItem.OnHand = Math.Max(0, stockItem.OnHand - quantity);
+            }
+
             stockItem.UpdatedUtc = DateTime.UtcNow;
 
-            MarkReleased(reservations);
+            MarkAs(reservations, target);
 
             try
             {
                 await context.SaveChangesAsync(cancellationToken);
 
                 logger.LogInformation(
-                    "Released {Quantity} of {Sku} for order {OrderId}.", quantity, sku, orderId);
+                    "{Target} {Quantity} of {Sku} for order {OrderId}.", target, quantity, sku, orderId);
 
                 return true;
             }
             catch (DbUpdateConcurrencyException)
             {
                 logger.LogWarning(
-                    "Concurrency conflict releasing {Quantity} of {Sku} for order {OrderId} (attempt {Attempt} of {MaxAttempts}). Reloading.",
+                    "Concurrency conflict settling {Quantity} of {Sku} for order {OrderId} (attempt {Attempt} of {MaxAttempts}). Reloading.",
                     quantity, sku, orderId, attempt, MaxConcurrencyAttempts);
 
                 // The reservations stay Modified and ride along on the retry; only the stock row is
@@ -230,18 +279,18 @@ public class InventoryData(InventoryDbContext context, ILogger<InventoryData> lo
         // held for an order that is already dead. It is louder than a warning for that reason, and
         // the caller re-raises so the message is abandoned and retried rather than settled.
         logger.LogError(
-            "FAILED to release {Quantity} of {Sku} for order {OrderId} after {MaxAttempts} concurrency conflicts. Stock remains held.",
-            quantity, sku, orderId, MaxConcurrencyAttempts);
+            "FAILED to settle {Quantity} of {Sku} for order {OrderId} as {Target} after {MaxAttempts} concurrency conflicts.",
+            quantity, sku, orderId, target, MaxConcurrencyAttempts);
 
         throw new InvalidOperationException(
-            $"Could not release {quantity} of '{sku}' for order {orderId} after {MaxConcurrencyAttempts} concurrency conflicts.");
+            $"Could not settle {quantity} of '{sku}' for order {orderId} as {target} after {MaxConcurrencyAttempts} concurrency conflicts.");
     }
 
-    private static void MarkReleased(IReadOnlyList<Reservation> reservations)
+    private static void MarkAs(IReadOnlyList<Reservation> reservations, ReservationState state)
     {
         foreach (var reservation in reservations)
         {
-            reservation.State = ReservationState.Released;
+            reservation.State = state;
         }
     }
 

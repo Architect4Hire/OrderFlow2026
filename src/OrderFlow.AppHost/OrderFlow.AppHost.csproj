@@ -19,16 +19,15 @@
     <PackageReference Include="Aspire.Hosting.JavaScript" Version="13.3.0" />
   </ItemGroup>
 
-  <!--
-    TODO (Prompt H1): add ProjectReference items for the five API projects once they
-    exist. The Aspire SDK source-generates the Projects.* types from these, so the
-    AddProject<> calls in Program.cs stay commented out until they land.
-
-    <ProjectReference Include="..\OrderFlow.Order.API\OrderFlow.Order.API.csproj" />
+  <ItemGroup>
+    <!-- The Aspire SDK source-generates the Projects.* types from these, which is what the
+         AddProject<> calls in Program.cs bind to. Orders and Payments are PLURAL (see B1 [C] —
+         the CS0118 namespace/type collision); the other three are singular. -->
+    <ProjectReference Include="..\OrderFlow.Orders.API\OrderFlow.Orders.API.csproj" />
     <ProjectReference Include="..\OrderFlow.Inventory.API\OrderFlow.Inventory.API.csproj" />
-    <ProjectReference Include="..\OrderFlow.Payment.API\OrderFlow.Payment.API.csproj" />
+    <ProjectReference Include="..\OrderFlow.Payments.API\OrderFlow.Payments.API.csproj" />
     <ProjectReference Include="..\OrderFlow.Fulfillment.API\OrderFlow.Fulfillment.API.csproj" />
     <ProjectReference Include="..\OrderFlow.Notification.API\OrderFlow.Notification.API.csproj" />
-  -->
+  </ItemGroup>
 
 </Project>

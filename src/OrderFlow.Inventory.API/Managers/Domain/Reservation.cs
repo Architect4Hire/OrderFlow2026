@@ -7,7 +7,17 @@ public enum ReservationState
     Held = 0,
 
     /// <summary>The saga compensated and gave the stock back. No longer counted.</summary>
-    Released = 1
+    Released = 1,
+
+    /// <summary>
+    /// The goods shipped. The hold became a permanent decrement — OnHand fell with Reserved.
+    /// </summary>
+    /// <remarks>
+    /// Without this state the happy path never closes, and a hold that SHIPPED is indistinguishable
+    /// from a hold STRANDED by a lost compensation: both sit at Held forever, side by side in the ops
+    /// view, the same colour. Being able to tell those apart is the entire point of this system.
+    /// </remarks>
+    Consumed = 2
 }
 
 /// <summary>

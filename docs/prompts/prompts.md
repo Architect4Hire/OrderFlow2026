@@ -4,6 +4,19 @@
 
 > **This library is derived from the OrderFlow High-Level Design.** Where the design doc says *what* and *why*, this library says *how* — as prompts. Section names below mirror the design doc so the two can be read side by side.
 
+> **Read this before you start.**
+> Parts A–H build the system prompt by prompt. **Part K then fixes it**, and the fixes are not
+> cosmetic — they are the difference between a system that looks right and one that survives its
+> own failure matrix. The three that matter most:
+> - **The AppHost could never start.** Not once, from A3 to F1. Every prompt ended on a green
+>   `dotnet build`, and a green build is not a running system. (H1)
+> - **The customer set the price they were charged.** (ADR-006 / K3)
+> - **A failed send at the front door stranded an order permanently and silently.** (ADR-007 / K1)
+>
+> None of those were caught by building, and none would have been caught by a demo of the happy
+> path. Run **K1 before you demo anything**, and **K4** so the failure matrix is executable rather
+> than a table in a document.
+
 ## How to use this library
 
 Each prompt follows the **SCRUB framework** from the *Practical AI Assisted Development* book:
@@ -59,7 +72,10 @@ going live is a config change, not a rewrite.
 - Azure Service Bus (emulated). Commands → one handler (queue). Events → many
   subscribers (topic/subscription).
 - Every message carries a `CorrelationId` (the OrderId) and a `MessageId`.
-- Consumers are idempotent: a durable processed-message key guards every handler.
+- Consumers are idempotent: a durable processed-message key guards every handler. The key is
+  `(ConsumerName, MessageId)`, and **ConsumerName is qualified by the SERVICE** — the saga and
+  Notification both have a `PaymentDeclinedConsumer`, and `payment-declined` is the one topic with
+  two subscribers. Bare class names would let one silently suppress the other (K1).
 - EVERY consumer in EVERY service derives from `ServiceBusConsumer<TMessage>` in
   ServiceDefaults (A5). It owns the settlement rules — abandon-don't-complete,
   dead-letter poison, `(ConsumerName, MessageId)` — so no service can restate them
@@ -132,13 +148,24 @@ PREFERRED — Do NOT:
 [S] Create `src/OrderFlow.Contracts/OrderFlow.Contracts.csproj` (classlib, net10.0)
     plus one file per message group under `Messages/`:
     - `Messages/Commands` — records: ReserveInventory, ReleaseInventory,
-      ChargePayment, RefundPayment, DispatchFulfillment. Create a class file per record
+      **CommitInventory**, ChargePayment, RefundPayment, DispatchFulfillment. Create a
+      class file per record
     - `Messages/Events` — records: OrderPlaced, InventoryReserved,
       InventoryRejected, PaymentSucceeded, PaymentDeclined, FulfillmentDispatched,
       FulfillmentFailed, OrderConfirmed, OrderFailed.  Create a class file per record
     - `Messages/MessageBase.cs` — an abstract record or interface carrying
       Guid MessageId, Guid CorrelationId (the OrderId), DateTime OccurredUtc.
     Every command and event derives from / implements the base.
+
+    PRICING (ADR-006 / K3), which changes three of these:
+    - `OrderPlaced` carries NO Total. A placed order is unpriced — the customer says what
+      they want, not what it costs.
+    - `InventoryReserved` carries the priced `Lines` and the order `Total`. Inventory owns
+      the catalogue, so this is the ONLY place a price enters the workflow, and it is the
+      number the saga charges.
+    - `CommitInventory` closes the happy path: the goods shipped, so the hold becomes a
+      permanent decrement. Without it, holds stay Held forever and a shipped order is
+      indistinguishable from a stranded one.
 
 [C] - Namespace `OrderFlow.Contracts.Messages`
     - Records, not classes. Init-only properties. Immutable.
@@ -289,7 +316,11 @@ PREFERRED — Do NOT:
       derives from. Subclass supplies `HandleAsync(IServiceProvider scope, TMessage,
       ct)`; the base owns processor setup, W3C trace re-parenting, the idempotency
       guard, and settlement. Virtuals: `SubscriptionName` (null = queue, a name = topic
-      subscription) and `MaxConcurrentCalls` (default 1).
+      subscription) and `MaxConcurrentCalls` (default 1). `ConsumerName` is
+      `{ApplicationName}.{TypeName}` — see the Messaging pre-load and K1.
+    - `DeadLetterBrowser.cs` + `MessagingTopology.cs` (K2) — PEEK every queue and every
+      subscription's dead-letter queue. Entity names derive from the contracts, so a
+      renamed message cannot silently drop a queue off the ops screen.
     - `MessagingExtensions.cs` — `AddOrderFlowMessaging(this IHostApplicationBuilder)`
       registering the bus and the idempotency store.
 
@@ -441,14 +472,20 @@ PREFERRED — Do NOT:
       can misjudge exactly the boundary value 99999.99.
 
 [R] CRITICAL — Do NOT:
+    0. Put `UnitPrice` on OrderLineViewModel. **SUPERSEDED BY ADR-006 / K3 — and this was
+       the security hole.** The original [S] below asks for it, and that one field meant
+       the client set the price, therefore Subtotal, therefore Total, therefore the amount
+       ChargePayment authorized. A laptop for a penny. A placed order is UNPRICED: the
+       client sends SKU + quantity, and Inventory (which owns the catalogue) returns the
+       price on InventoryReserved.
     1. Accept State, Id, Subtotal, or Total on the incoming ViewModel — all server-
        controlled. The client sends lines; the server prices and drives state.
-       OPEN TENSION: [S] nonetheless puts UnitPrice on OrderLineViewModel, so the client
-       DOES price the order — and therefore controls Total, and therefore the amount
-       ChargePayment authorizes. Implemented as [S] says, with a `// TODO:` at the
-       property. Resolve by either (a) pricing from the SKU server-side (needs a price
-       source — StockItem has none), or (b) recording it as an explicit POC
-       simplification in an ADR. Do not leave it merely implicit.
+       RESOLVED — ADR-006 / Prompt K3. The tension was real and it was a security hole:
+       [S] put UnitPrice on OrderLineViewModel, so the client priced the order, controlled
+       Total, and therefore controlled the amount ChargePayment authorized. A laptop for a
+       penny. The root cause was that NO SERVICE KNEW WHAT ANYTHING COST — the price was
+       missing from the domain, not merely mis-sourced. StockItem now carries UnitPrice,
+       the ViewModel carries none, and the price comes back on InventoryReserved.
     IMPORTANT — Do NOT:
     2. Reference the Domain model from either file.
 
@@ -523,8 +560,26 @@ PREFERRED — Do NOT:
       as declared — "OrderId" — and EVERY write fails on a partition-key mismatch.
       Bundle this into an `AddOrderEventStore(this IHostApplicationBuilder)` extension
       so B11 cannot forget it or "tidy away" the options lambda.
-    - Cosmos requires the document key to be named `id`: `[JsonPropertyName("id")]` on
-      EventId.
+    - Cosmos requires the document key to be named `id`: `[JsonPropertyName("id")]`.
+    - **SEQUENCE THE STREAM (K1).** The envelope carries a per-stream monotonic
+      `Sequence` from 1, and the document id is `{orderId:N}-{sequence:D4}`. Read with
+      `ORDER BY c.sequence`, never `ORDER BY c.occurredUtc` — a DateTime has no tiebreak,
+      two events in the same clock tick sort arbitrarily, and REHYDRATION ORDER DETERMINES
+      STATE. An order could rehydrate as Paid-then-Reserved and the saga would draw a
+      conclusion from a history that never happened.
+      Putting the sequence IN the id makes it enforced rather than merely recorded: two
+      writers who both think they are event 3 collide on the key, and one of them is told
+      so (catch the 409, re-read, take the next slot). And an append of an event type the
+      stream already carries becomes a NO-OP, so a replayed handler cannot duplicate
+      history.
+    - Orders needs a SECOND Cosmos container (`processed-messages`, partitioned by
+      `/consumerName`) for the durable idempotency store, so both containers must be
+      registered with `AddKeyedAzureCosmosContainer` — an unkeyed `Container` would let
+      one silently win, and the symptom is processed-message documents landing in the
+      event log.
+    - `ListOrderIdsAsync` is the ONE deliberate cross-partition query in the system. It
+      exists only so the projection can be rebuilt (K2). Confine it to one method so
+      "we never fan out across partitions" stays true of everything else.
 
 [R] CRITICAL — Do NOT:
     1. Update or delete an existing event. Ever. Append is the only write. Use
@@ -620,11 +675,16 @@ PREFERRED — Do NOT:
     1. Reference Cosmos/Redis/ServiceBus SDK types from the Facade.
     2. Drive later saga steps from Business. Business only STARTS the saga (sends the
        first command, ReserveInventory). Everything after is consumer-driven (B9).
-       OPEN TENSION: this means "the first step of a placed order is to reserve
-       inventory" lives in Business — the one piece of orchestration outside the saga,
-       and exactly what diagnostic I6 is written to catch. To close it, add a StartAsync
-       bullet to B8's [S] and have Business call that instead (~6 lines). Recommended:
-       B8 is the file a reviewer opens first.
+       OPEN TENSION (still open): this means "the first step of a placed order is to
+       reserve inventory" lives in Business — the one piece of orchestration outside the
+       saga, and exactly what diagnostic I6 is written to catch. To close it, add a
+       StartAsync bullet to B8's [S] and have Business call that instead (~6 lines).
+       Recommended: B8 is the file a reviewer opens first.
+
+       NOTE: the recovery sweeper (K1 / ADR-007) now holds the SAME knowledge — which
+       command each state is waiting on. That mapping therefore exists in two places, and
+       will exist in three until this tension is closed. Closing it makes the sweeper the
+       only other holder, which is the most it should ever be.
     IMPORTANT — Do NOT:
     3. Return Domain entities from any method.
     4. Pretend the three writes are atomic. Append (Cosmos) → project (Redis) → send
@@ -671,6 +731,15 @@ PREFERRED — Do NOT:
     - Every emitted message gets `MessagingConventions.DeterministicMessageId(orderId,
       nameof(TheMessage))` so a replay is deduped by the receiver's (ConsumerName,
       MessageId) guard rather than issuing a second refund.
+    - OnInventoryReserved: stamp the prices carried on `InventoryReserved` onto the
+      aggregate BEFORE projecting it, then charge `order.Total`. Skip that and
+      ChargePayment authorizes £0 (ADR-006 / K3).
+    - OnFulfillmentDispatched: ALSO send `CommitInventory`, alongside the confirm. Same
+      shape as OnFulfillmentFailed sending two commands — still one event in, one decision
+      out. Without it the happy path never closes: the hold stays Held forever and OnHand
+      never falls (ADR-006 / K3).
+    - Rehydration belongs in a SHARED `OrderRehydrator`, not private to this class — the
+      projection rebuild (K2) folds the same stream, and two folds eventually disagree.
     - All state changes for an order funnel through this class — the ONE auditable
       place transitions happen.
 
@@ -815,28 +884,29 @@ PREFERRED — Do NOT:
 > `Inventory` entity, so no CS0118) and Inventory's package list. C1 assumes the
 > project already exists; there is no separate skeleton prompt for it.
 > 
-> **Open question, decide before C1.** `ReservationState` is `{ Held, Released }` and
-> the contracts have `ReserveInventory` / `ReleaseInventory` — but NOTHING tells
-> Inventory the goods shipped. On the happy path the hold stays `Held` forever and
-> `OnHand` is never decremented. The arithmetic survives (`Available = OnHand -
-> Reserved` is unchanged either way), but the ops view fills with `Held` rows that
-> shipped weeks ago sitting next to `Held` rows stranded by a lost compensation — the
-> same colour on screen, and telling them apart is the entire diagnostic this POC
-> exists to demonstrate. Either add `Consumed = 2` plus a `CommitInventory` command
-> (A2 contract + ~4 lines in B8's OnFulfillmentDispatched, alongside the confirm — same
-> shape as OnFulfillmentFailed already sending two commands), or record it as an
-> explicit POC simplification in an ADR. Do not leave it implicit.
+> **RESOLVED by ADR-006 / K3 — build it this way from the start.** `ReservationState` is
+> `{ Held, Released, Consumed }`, and `CommitInventory` closes the happy path. Without the third
+> state, nothing ever tells Inventory the goods shipped: the hold stays `Held` forever and `OnHand`
+> never falls. The arithmetic survives (`Available = OnHand - Reserved` is unchanged either way),
+> but the ops view fills with `Held` rows for orders that shipped weeks ago, sitting next to `Held`
+> rows stranded by a lost compensation — the same colour on screen. Telling those apart is the
+> entire diagnostic this POC exists to demonstrate.
+>
+> **Inventory also owns the CATALOGUE.** `StockItem` carries `UnitPrice`, and it is the only price
+> in the system. It travels back to the saga on `InventoryReserved`, and that is the number the
+> customer is charged. The client sends no price at all (ADR-006).
 
 ## Prompt C1 — Inventory domain + models 💬
 
 ```text
 [S] Create:
-    - `Managers/Domain/StockItem.cs` — Sku (string, key), OnHand (int), Reserved
-      (int), a computed Available => OnHand - Reserved, RowVersion (byte[] — the
-      optimistic-concurrency token), UpdatedUtc.
+    - `Managers/Domain/StockItem.cs` — Sku (string, key), OnHand (int), **UnitPrice
+      (decimal — the catalogue price, ADR-006)**, Reserved (int), a computed
+      Available => OnHand - Reserved, RowVersion (byte[] — the optimistic-concurrency
+      token), UpdatedUtc.
     - `Managers/Domain/Reservation.cs` — Id, OrderId, Sku, Quantity, State
-      { Held=0, Released=1 }.
-    - ServiceModels exposing SKU availability for the ops view.
+      { Held=0, Released=1, **Consumed=2** }.
+    - ServiceModels exposing SKU availability AND price for the ops view.
 
 [C] - Namespace `OrderFlow.Inventory.API.Managers.Domain`
     - RowVersion is the EF concurrency token (`[Timestamp]`-equivalent configured in
@@ -878,8 +948,16 @@ PREFERRED — Do NOT:
     concurrency (RowVersion). If any line cannot be satisfied, RELEASE any holds
     already taken for this order in this call and return a rejection. On full success,
     persist Reservation rows (Held) and return success.
+    ReserveAsync also returns the PRICED LINES and the order TOTAL, read off the
+    StockItem rows it just held. Inventory owns the catalogue, so this is where the order
+    gets its price (ADR-006). The caller never proposes one.
     Also ReleaseAsync(Guid orderId, ct): flip this order's Held reservations to
     Released and decrement Reserved accordingly.
+    Also CommitAsync(Guid orderId, ct): the goods shipped — flip Held to Consumed and
+    decrement Reserved AND OnHand. Release and Commit are the same operation with one
+    difference: release gives the stock back (Reserved falls, OnHand does not); commit
+    takes it away for good (both fall). Share the code path — the invariant that matters is
+    that the stock level and the reservation's fate move in ONE transaction.
 
     Also create `Managers/DataContext/InventoryDbContext.cs` — the RowVersion config
     that [R]1 depends on lives in its OnModelCreating, so it cannot be a later prompt.
@@ -954,8 +1032,11 @@ PREFERRED — Do NOT:
 [S] Create:
     - Consumer for ReserveInventory: idempotency guard → Business.ReserveAsync →
       publish InventoryReserved OR InventoryRejected (with reason).
+      The reply carries the PRICED lines and the total (ADR-006).
     - Consumer for ReleaseInventory: idempotency guard → Business.ReleaseAsync
       (no reply event needed; it is a compensation).
+    - Consumer for CommitInventory: idempotency guard → Business.CommitAsync (no reply;
+      the mirror image of release, and the message that closes the happy path).
     - Facade, Controller (read-only ops endpoints: GET /api/Inventory for per-SKU
       availability), and Program.cs mirroring the Order wiring but referencing SQL +
       Service Bus (no Cosmos/Redis).
@@ -1477,30 +1558,58 @@ PREFERRED — Do NOT:
 
 ## Prompt H1 — Wire AppHost project references ✏️
 
+> **THE AppHost COULD NOT START — AND NOT FOR THE REASON THIS PROMPT ASSUMED.**
+> Every prompt from B1 to F1 ended with a green `dotnet build`, and for that entire time
+> `dotnet run` on the AppHost would have failed instantly. `AddJavaScriptApp("web",
+> "../OrderFlow.Web", "start")` — emitted live back in A3 — resolves its directory EAGERLY, and
+> `src/OrderFlow.Web` does not exist until Part G. **A green build is not a running system, and
+> nothing in this library ever asked it to run.** Do not let a build be the only gate again.
+
 ```text
 [S] - Edit `src/OrderFlow.AppHost/OrderFlow.AppHost.csproj` to add ProjectReference
       items for the five API csproj files now that they exist.
-    - Edit `src/OrderFlow.AppHost/Program.cs` to UNCOMMENT the five AddProject blocks
-      and the Angular `.WithEnvironment(...)`/`.WaitFor(...)` lines that depend on
-      them. Prompt A3 could not emit those live: the `Projects.*` types are SOURCE-
-      GENERATED from the ProjectReference items above, so they do not exist until this
-      step. They were written out in full and commented, so this is a pure uncomment.
+    - Edit `src/OrderFlow.AppHost/Program.cs` to UNCOMMENT the five AddProject blocks.
+      A3 could not emit those live: the `Projects.*` types are SOURCE-GENERATED from the
+      ProjectReference items above, so they do not exist until this step.
+    - COMMENT OUT the `AddJavaScriptApp("web", ...)` resource until G1 scaffolds the
+      Angular workspace. Uncomment it in G1, not here.
+    - Set `MaxDeliveryCount` on the command queues.
+    - Add the failure-injection parameters and pass them to the services as environment
+      variables (see [C]).
 
-[C] Two-file edit. Keep existing PackageReference items unchanged.
+[C] - **The project names are PLURAL for Orders and Payments** (B1 [C], the CS0118
+      collision): `OrderFlow.Orders.API`, `OrderFlow.Payments.API`. The commented block
+      A3 wrote out predates that rename and names the singular projects — it will not
+      compile as-is. This is exactly the "pure uncomment" that turns out not to be.
+    - `MaxDeliveryCount = 4` on every command queue, via
+      `.WithProperties(queue => queue.MaxDeliveryCount = 4)`. The default is 10, which
+      means a failing message takes ten rounds of lock-expiry and backoff to reach the
+      dead-letter queue — minutes of dead air in a demo whose whole point is showing you
+      the dead-letter queue.
+    - Declare the `commit-inventory` queue (ADR-006 / Prompt B8) and the
+      `processed-messages` Cosmos container (the saga's durable idempotency store,
+      partitioned by `/consumerName`).
+    - **Failure injection lives HERE, not in the services.** Add parameters —
+      `carrier-failure-mode`, `payment-decline-all`, `payment-decline-over-amount`,
+      `notification-provider-down`, `notification-provider-hangs` — with defaults in
+      `appsettings.Development.json`, and pass each to its service with
+      `.WithEnvironment("Carrier__FailureMode", carrierFailureMode)` and friends. Without
+      this, H3's "drive failures via the configurable simulators" is not possible: the
+      simulators exist and NOTHING can set them. No service has an appsettings.json.
 
 [R] CRITICAL — Do NOT:
     1. Add a ProjectReference to ServiceDefaults or Contracts from the AppHost — the
        APIs reference those; the AppHost doesn't need them directly.
     2. Add a ProjectReference to OrderFlow.Web — it's an npm app, not a .NET project.
+    3. Leave the `web` resource active before G1 exists. It fails the host at STARTUP,
+       not at build, which is why it went unnoticed for six prompts.
+    IMPORTANT — Do NOT:
+    4. Declare H1 done on a green build. Run it. Watch five services go Healthy in the
+       dashboard. That is the acceptance criterion.
 
-[B] B-DOMINANT (Edit Mode):
-    - In the csproj: ONLY ADD the five ProjectReference lines.
-    - In Program.cs: ONLY remove the leading `// ` from the already-written AddProject
-      and Angular env-var lines. Do NOT re-author them — if a line does not compile
-      once uncommented, say so rather than rewriting it.
-    - Do NOT modify any other existing element in either file.
-    - Do NOT reformat unrelated lines.
-    - All other project state must be byte-for-byte identical.
+[B] B-DOMINANT (Edit Mode): add the ProjectReference lines, uncomment the AddProject
+    blocks (fixing the stale singular project names), comment the web resource, and add
+    the queue properties and parameters. Do NOT touch the resource declarations above.
 ```
 
 ## Prompt H2 — Happy-path sanity check ✏️
@@ -1540,9 +1649,22 @@ PREFERRED — Do NOT:
     6. Notification provider down → confirm the order still Confirms unaffected.
     7. Poison message → confirm dead-letter after max delivery, replayable.
 
-[C] Drive failures via the configurable simulators (decline rule, transient/permanent
-    carrier flag) and by redelivering/poisoning messages — NOT by editing service code
-    mid-demo.
+[C] Drive failures from the AppHost PARAMETERS (H1 [C]) — `carrier-failure-mode`,
+    `payment-decline-all`, `notification-provider-down`, `notification-provider-hangs` —
+    and by redelivering/poisoning messages. NOT by editing service code mid-demo, and not
+    by editing appsettings inside a service: the services have none, by design. Change a
+    parameter, restart the AppHost, and one row of the matrix fires.
+
+    Scenario 4's ops view is now `GET /api/Orders/dead-letters`, which browses EVERY
+    queue and subscription — not just fulfillment's. A dead-lettered ReleaseInventory is
+    the stranded-stock bug this system exists to prevent, and it used to be invisible.
+
+    Add an eighth scenario, because it is the one failure the architecture could not
+    previously survive:
+    8. Stranded order → kill the Service Bus emulator, POST an order (the append
+       succeeds, the ReserveInventory send fails), restart the broker. Confirm the order
+       appears in `GET /api/Orders/stuck`, and that the recovery sweeper re-drives it to
+       Confirmed without a second order being created (ADR-007).
 
 [R] CRITICAL — Do NOT:
     1. Declare a scenario "passing" from logs alone — show the trace and the ops view
@@ -1554,6 +1676,203 @@ PREFERRED — Do NOT:
 
 [B] These are demonstrations, not edits. Code changes only if a scenario reproduces a
     genuine defect.
+```
+
+---
+
+# PART K — The hardening pass (run AFTER H1, BEFORE the demo)
+
+> Everything in Parts A–H builds and, once H1 is fixed, runs. It is also, at that point,
+> **wrong in ways that only show up when something breaks** — which, for an architecture whose
+> entire subject is failure paths, is the only place it matters.
+>
+> These prompts came out of a critical review of the finished build. They are in dependency order:
+> K1 fixes things that lose orders, K2 makes the system's own claims true, K3 closes the gaps the
+> library papered over, K4 makes the failure matrix executable. **Run K1 before demoing anything.**
+
+## Prompt K1 — Close the holes that lose orders 🤖
+
+```text
+[S] 1. `ReserveInventory` is sent with a RANDOM MessageId (Prompt B7). Every other message
+       in the system uses `MessagingConventions.DeterministicMessageId`. Fix it — this is
+       the command that STARTS the saga and it is the only one that cannot be safely
+       re-sent.
+    2. `ServiceBusConsumer.ConsumerName` is `GetType().Name`. Qualify it with the
+       application name.
+    3. Replace the in-memory idempotency store with a DURABLE one per service:
+       Cosmos (`processed-messages`, partition `/consumerName`) for Orders,
+       a `ProcessedMessages` table for Inventory and Payments.
+    4. Give the Cosmos event store a per-stream monotonic `Sequence`, with the document id
+       as `{orderId:N}-{sequence:D4}`.
+    5. Add `OrderRecoveryManager` + `OrderRecoverySweeper` to the Order service (ADR-007).
+
+[C] - (2) The saga and the notification service BOTH have a class called
+      `PaymentDeclinedConsumer`, and `payment-declined` is the one topic with two
+      subscribers. Keyed on the bare class name, a durable shared store lets whichever
+      service handled the event first SUPPRESS the other — the saga compensates and the
+      customer is never told, or the reverse. This is invisible while every store is
+      process-local, and silently fatal the moment one is not. Doing (3) without (2) is
+      how you ship the bug.
+    - (4) The store previously sorted by `OccurredUtc` — a DateTime with no tiebreak. Two
+      events in the same clock tick sort arbitrarily, and rehydration order DETERMINES
+      STATE, so an order could rehydrate as Paid-then-Reserved and the saga would draw a
+      conclusion from a history that never happened. The sequence in the id also makes the
+      append optimistically concurrent: two writers who both think they are event 3 collide
+      on the key and one is told so. And appending an event type the stream already carries
+      becomes a no-op, so a replayed handler cannot duplicate history.
+    - (5) THE hole. Everything driven by a MESSAGE recovers on its own — the broker
+      redelivers, and eventually dead-letters where a human can see it. `PlaceAsync` is
+      driven by HTTP and gets ONE attempt: it appends OrderPlaced, projects the order, then
+      sends ReserveInventory. If that send throws, the order EXISTS, is Placed, is in the
+      active list — and nothing is listening and nothing ever will be. No message was lost,
+      so no dead-letter queue shows anything. The customer sees a 500, re-posts, and gets a
+      SECOND order. It is the only failure that is both silent and permanent, and it is at
+      the front door. The sweeper re-sends the command each stuck order's state is waiting
+      on; the deterministic MessageId from (1) is what makes re-sending free when the
+      command actually got through.
+
+[R] CRITICAL — Do NOT:
+    1. Implement (3) before (2). See [C].
+    2. Let the sweeper re-drive an order whose reply DEAD-LETTERED. That failure is
+       visible and wants a human; a sweeper that quietly retried it would destroy the
+       evidence the ops view exists to show. Recovery and diagnosis are different jobs.
+    3. Have the sweeper touch order STATE. It re-sends a command. The saga owns state.
+    IMPORTANT — Do NOT:
+    4. Claim this is an outbox. It is not, and ADR-007 says so: the window between append
+       and send still exists, it just closes within a minute instead of never.
+
+[U] After this, no single failure in the system loses an order silently.
+
+[B] Existing files. Do not re-author the saga's decision logic.
+```
+
+## Prompt K2 — Make the system's own claims true 🤖
+
+```text
+[S] 1. Promote Fulfillment's dead-letter reader into ServiceDefaults as
+       `IDeadLetterBrowser` + `MessagingTopology`, covering EVERY queue and subscription.
+       Expose `GET /api/Orders/dead-letters`.
+    2. `GET /api/Orders/stuck` — non-terminal orders that have stopped moving.
+    3. `GET /api/Orders/{id}/timeline` — the order's full event stream.
+    4. `POST /api/Orders/rebuild-projection` — replay every stream into Redis.
+    5. Extract `OrderRehydrator` from the saga so the rebuild and the saga share ONE fold.
+
+[C] - (1) Fulfillment's DLQ was the only one the system could show, which quietly implied
+      dispatch was the only thing that could get stuck. It is not, and it is not even the
+      important one: **a dead-lettered `ReleaseInventory` is the stranded-stock bug this
+      entire architecture exists to prevent**, and it was invisible. So was a dead-lettered
+      `RefundPayment` — money taken from a customer whose order failed, with nothing on any
+      screen to say so.
+    - PEEK, never RECEIVE. A receive-based ops screen consumes the very messages it exists
+      to display; the evidence evaporates the moment somebody looks at it. Read the
+      correlation id off the ENVELOPE — some of those messages are in the DLQ precisely
+      because their body will not deserialize.
+    - (3) Nearly free, and the most useful endpoint in the system. The event store already
+      holds every fact, in order. "Why did this order fail?" stops being an archaeology dig
+      across five services' logs and becomes one GET.
+    - (4) **ADR-003 says Redis is a projection that can be rebuilt from the event log. That
+      was FALSE** — nothing could rebuild it, so a flushed Redis meant the ops list stayed
+      permanently empty while orders were genuinely in flight. The document said one thing
+      and the code did another.
+    - (5) Two interpretations of "what state is this order in" will eventually disagree, and
+      the disagreement surfaces as an ops view confidently reporting a state the saga does
+      not believe in.
+
+[R] CRITICAL — Do NOT:
+    1. RECEIVE from a dead-letter queue to display it.
+    2. Write a second rehydration for the rebuild. Share the saga's.
+    IMPORTANT — Do NOT:
+    3. Run the rebuild on a timer. It is the ONE cross-partition Cosmos query in the
+       system; it is an operator action, not a background job.
+
+[B] Existing files + new ops surface.
+```
+
+## Prompt K3 — The gaps the library papered over 🤖
+
+```text
+[S] 1. **Server-side pricing (ADR-006).** `StockItem` gains `UnitPrice`.
+       `OrderLineViewModel` LOSES `UnitPrice`. `OrderPlaced` loses `Total`.
+       `InventoryReserved` gains priced `Lines` + `Total`. The saga charges what Inventory
+       returned.
+    2. **`CommitInventory` (ADR-006).** New command; `ReservationState.Consumed`; the saga
+       sends it from `OnFulfillmentDispatchedAsync` alongside the confirm.
+    3. **EF migrations** replacing `EnsureCreated` in Inventory and Payments.
+    4. Write ADR-006 and ADR-007, and amend ADR-003.
+
+[C] - (1) This is the finding a security reviewer opens with. The client sent `UnitPrice`;
+      `ToDomain` copied it; `Total` was computed from it; the saga put it in
+      `ChargePayment.Amount`. **The customer set the price they were charged** — a laptop
+      for a penny by editing one field of the JSON they were already sending. No validation
+      could have caught it, because there was nothing to validate against: NO SERVICE KNEW
+      WHAT ANYTHING COST. The price was missing from the domain, not merely mis-sourced.
+      The fix falls out of the existing message flow — Inventory holds the StockItem row, so
+      Inventory knows the price, so the reply the saga is already waiting for carries it.
+      Accept the consequence: a placed order is briefly worth £0, because the customer has
+      said what they want and nobody has yet said what it costs.
+    - (2) Without it the happy path never closes: the hold stays Held forever, OnHand never
+      falls, and the ops view fills with Held rows for orders that shipped weeks ago —
+      sitting next to the Held rows stranded by a lost compensation, the same colour.
+      Telling those apart is the entire point of the system.
+    - (3) SQL runs on a PERSISTENT volume (A3), and `EnsureCreated` only creates a schema
+      that is absent. The first schema change would leave every existing database silently on
+      the old shape, failing at runtime on a column nobody can find. Add an
+      `IDesignTimeDbContextFactory` — the EF tooling cannot resolve Aspire's connection
+      string, and migrations are generated by comparing models, not by opening a connection.
+
+[R] CRITICAL — Do NOT:
+    1. Keep `UnitPrice` on the ViewModel "and validate it". You need the real price anyway,
+       so you do all this work AND keep the forged field, AND add a comparison that has to
+       decide what to do when they disagree. Strictly worse.
+    2. Have Orders call Inventory over HTTP to price the order. It puts a synchronous
+       dependency on the front of an architecture whose thesis is that services meet on the
+       bus and never in the request path.
+    IMPORTANT — Do NOT:
+    3. Ship "the client sets the price" as a documented POC simplification. This is a
+       reference architecture people are meant to copy.
+
+[B] Touches Contracts, Orders and Inventory together — they must land in one change.
+```
+
+## Prompt K4 — The failure matrix, executable ✏️🤖
+
+```text
+[S] - `tests/OrderFlow.UnitTests` — the saga's compensation ORDERING, the terminal guard,
+      all-or-nothing reservation, duplicate-charge collapse, best-effort notification,
+      and the carrier's three outcomes. Hand-written fakes; no containers; sub-second.
+    - `tests/OrderFlow.IntegrationTests` — `Aspire.Hosting.Testing` boots the real AppHost.
+      One test per row of the failure matrix, with failures injected through the AppHost
+      PARAMETERS (H1), exactly as an operator would.
+
+[C] - **Do NOT use EF InMemory.** It enforces neither row versions nor unique indexes, so a
+      green test against it would IMPLY the oversell guard and the double-charge guard work
+      when it had proven nothing of the sort. Those two guarantees are made by the DATABASE.
+      A fake cannot make them on its behalf, and a fake that pretends to is worse than no
+      test — it is a false negative with a green tick.
+    - For the compensation paths, assert on the ORDER of the messages, not just their
+      presence. "Did it release the stock?" is half the question. "Did it release the stock
+      BEFORE it marked the order terminal?" is the half that protects the warehouse.
+    - The integration suite needs Docker. That is honest: the thing it tests is the thing it
+      needs.
+
+[R] CRITICAL — Do NOT:
+    1. Assert only that a compensation was SENT. Assert it was sent before the terminal
+       state, and that a REDELIVERED event does not send it twice.
+    2. Fake away the Polly pipeline in the notification tests. The retry bound and the
+       timeout ARE the behaviour under test.
+    IMPORTANT — Do NOT:
+    3. Trust a timeout test that passes. **Polly times out by cancelling the token; it
+       cannot abandon a Task that ignores one.** A stub whose delay does not observe
+       cancellation cannot be timed out, and the test will hang for the full duration and
+       fail. That is not a broken test — it is the discovery that the timeout is a CONTRACT
+       and the provider has to keep its half. Any real provider that blocks without a
+       token cannot be timed out by this pipeline at all.
+
+[U] The compensation logic is "the centerpiece deliverable" (B8 [U]) and had ZERO automated
+    coverage. A reference architecture about failure paths that cannot demonstrate its own
+    failure paths on demand is a document, not a system.
+
+[B] New projects. Add a `/tests/` folder to the .slnx.
 ```
 
 ---

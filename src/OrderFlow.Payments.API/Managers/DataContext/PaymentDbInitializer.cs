@@ -7,9 +7,10 @@ namespace OrderFlow.Payments.API.Managers.DataContext;
 /// created by a charge.
 /// </summary>
 /// <remarks>
-/// <c>EnsureCreated</c>, not migrations. Right for a POC whose SQL container is disposable, wrong the
-/// moment the schema has to change without losing data.
-/// TODO: replace with EF migrations before this is anything but a demo.
+/// <b>Migrations, not EnsureCreated.</b> SQL runs on a persistent volume, so the database outlives
+/// the container — and EnsureCreated only ever creates a schema that is absent. The first schema
+/// change would leave every existing database silently on the old shape, and the service would fail
+/// at runtime on a column nobody can find. Migrate() applies the delta to whatever is already there.
 /// </remarks>
 public static class PaymentDbInitializer
 {
@@ -21,6 +22,6 @@ public static class PaymentDbInitializer
 
         // This is what creates the unique index on IdempotencyKey. Without it the service still
         // runs, still charges, and silently loses its only real protection against a double charge.
-        await context.Database.EnsureCreatedAsync(cancellationToken);
+        await context.Database.MigrateAsync(cancellationToken);
     }
 }

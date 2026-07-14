@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The failure matrix, executable.
+
+         These test the DECISIONS — compensation ordering, the terminal guard, all-or-nothing
+         reservation, duplicate-charge collapse — against hand-written fakes rather than Cosmos,
+         Redis, SQL and a broker. No containers, so they run in a second and can gate every commit.
+
+         DELIBERATELY NOT using EF InMemory: it enforces neither row versions nor unique indexes, so
+         a green test against it would IMPLY the oversell guard and the double-charge guard work when
+         it had proven nothing of the sort. Those two guarantees are made by the DATABASE, and only a
+         real SQL Server can demonstrate them — see OrderFlow.IntegrationTests. -->
+    <ProjectReference Include="..\..\src\OrderFlow.Orders.API\OrderFlow.Orders.API.csproj" />
+    <ProjectReference Include="..\..\src\OrderFlow.Inventory.API\OrderFlow.Inventory.API.csproj" />
+    <ProjectReference Include="..\..\src\OrderFlow.Payments.API\OrderFlow.Payments.API.csproj" />
+    <ProjectReference Include="..\..\src\OrderFlow.Fulfillment.API\OrderFlow.Fulfillment.API.csproj" />
+    <ProjectReference Include="..\..\src\OrderFlow.Notification.API\OrderFlow.Notification.API.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+    <PackageReference Include="xunit.v3" Version="3.2.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+</Project>

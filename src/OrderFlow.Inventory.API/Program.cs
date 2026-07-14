@@ -15,7 +15,10 @@ builder.AddServiceDefaults();
 // Registered before the consumers, which start pulling the moment the host starts. SQL and Service
 // Bus only — Inventory has no business knowing that Cosmos or Redis exist.
 builder.AddInventoryDataContext();  // SQL "InventoryDb"
-builder.AddOrderFlowMessaging();    // Service Bus "servicebus" + the idempotency store
+
+// DURABLE idempotency, backed by this service's own database rather than a dictionary that dies
+// with the process.
+builder.AddOrderFlowMessaging<SqlIdempotencyKeyStore>();
 
 // ── The onion ───────────────────────────────────────────────────────────────────────────────────
 builder.AddInventoryData();

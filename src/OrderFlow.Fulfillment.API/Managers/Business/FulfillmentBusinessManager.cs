@@ -1,7 +1,7 @@
 using OrderFlow.Contracts.Messages;
-using OrderFlow.Fulfillment.API.Managers.Data;
 using OrderFlow.Fulfillment.API.Managers.Extensions;
 using OrderFlow.Fulfillment.API.Managers.ServiceModels;
+using OrderFlow.ServiceDefaults.Messaging;
 
 namespace OrderFlow.Fulfillment.API.Managers.Business;
 
@@ -57,9 +57,13 @@ public interface IFulfillmentBusinessManager
 /// </remarks>
 public class FulfillmentBusinessManager(
     ICarrierClient carrierClient,
-    IDeadLetterData deadLetterData,
+    IDeadLetterBrowser deadLetterBrowser,
     ILogger<FulfillmentBusinessManager> logger) : IFulfillmentBusinessManager
 {
+    /// <summary>This service's own dead-letter queue. The system-wide view lives in Orders.</summary>
+    private static readonly DeadLetterSource DispatchQueue =
+        new(MessagingConventions.EntityNameFor<DispatchFulfillment>());
+
     public async Task<DispatchResult> DispatchAsync(
         Guid orderId,
         string customerRef,
@@ -90,7 +94,7 @@ public class FulfillmentBusinessManager(
     public async Task<IReadOnlyList<StuckDispatchServiceModel>> ListStuckAsync(
         int maxMessages,
         CancellationToken cancellationToken = default) =>
-        (await deadLetterData.PeekDeadLetteredAsync(maxMessages, cancellationToken)).ToServiceModels();
+        (await deadLetterBrowser.PeekAsync(DispatchQueue, maxMessages, cancellationToken)).ToServiceModels();
 }
 
 public static class FulfillmentBusinessExtensions

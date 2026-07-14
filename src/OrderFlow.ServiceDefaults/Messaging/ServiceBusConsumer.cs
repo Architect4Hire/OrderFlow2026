@@ -41,12 +41,17 @@ public abstract class ServiceBusConsumer<TMessage>(
     where TMessage : MessageBase
 {
     /// <summary>
+    /// The running service. ServiceDefaults passes this same name to <c>AddSource(...)</c>, and it
+    /// is also what qualifies <see cref="ConsumerName"/>.
+    /// </summary>
+    private static readonly string ApplicationName = Assembly.GetEntryAssembly()?.GetName().Name ?? "OrderFlow";
+
+    /// <summary>
     /// Named for the entry assembly, which is the ApplicationName that ServiceDefaults passes to
     /// <c>AddSource(...)</c>. Get this wrong and the spans are simply dropped, and the end-to-end
     /// trace — the thing that proves the saga works — quietly loses every consumer hop.
     /// </summary>
-    private static readonly ActivitySource ActivitySource =
-        new(Assembly.GetEntryAssembly()?.GetName().Name ?? "OrderFlow");
+    private static readonly ActivitySource ActivitySource = new(ApplicationName);
 
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web);
 
@@ -65,8 +70,18 @@ public abstract class ServiceBusConsumer<TMessage>(
     /// </summary>
     protected virtual int MaxConcurrentCalls => 1;
 
-    /// <summary>Distinct per consumer — this is the ConsumerName half of the idempotency key.</summary>
-    protected string ConsumerName => GetType().Name;
+    /// <summary>
+    /// The ConsumerName half of the idempotency key, qualified by the SERVICE.
+    /// </summary>
+    /// <remarks>
+    /// The class name alone is not unique across the system: the order saga and the notification
+    /// service both have a <c>PaymentDeclinedConsumer</c>, and <c>payment-declined</c> is precisely
+    /// the topic with two subscribers. Keyed on the bare class name, a durable shared store would let
+    /// whichever service handled the event first suppress the other — the saga would compensate and
+    /// the customer would never be told, or the reverse. Harmless only while every store is
+    /// process-local; a latent, silent bug the moment one is not.
+    /// </remarks>
+    protected string ConsumerName => $"{ApplicationName}.{GetType().Name}";
 
     /// <summary>
     /// Handle the message. Runs inside a fresh DI scope, after the idempotency guard has already

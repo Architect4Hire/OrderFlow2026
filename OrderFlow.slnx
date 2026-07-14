@@ -9,4 +9,8 @@
     <Project Path="src/OrderFlow.Payments.API/OrderFlow.Payments.API.csproj" />
     <Project Path="src/OrderFlow.ServiceDefaults/OrderFlow.ServiceDefaults.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/OrderFlow.IntegrationTests/OrderFlow.IntegrationTests.csproj" />
+    <Project Path="tests/OrderFlow.UnitTests/OrderFlow.UnitTests.csproj" />
+  </Folder>
 </Solution>

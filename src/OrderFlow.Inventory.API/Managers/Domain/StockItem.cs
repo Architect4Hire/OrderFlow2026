@@ -25,6 +25,16 @@ public class StockItem
     /// <summary>Units physically in the warehouse, held or not.</summary>
     public int OnHand { get; set; }
 
+    /// <summary>
+    /// What the SKU costs. <b>The authoritative price, and the only one in the system.</b>
+    /// </summary>
+    /// <remarks>
+    /// Inventory owns the catalogue, so Inventory owns the price. It travels back to the saga on
+    /// InventoryReserved, and that is the number the customer is charged. The client no longer sends
+    /// a price at all — it used to, which meant it could buy anything for a penny (ADR-006).
+    /// </remarks>
+    public decimal UnitPrice { get; set; }
+
     /// <summary>Units spoken for by orders currently in flight. Rises on hold, falls on release.</summary>
     public int Reserved { get; set; }
 

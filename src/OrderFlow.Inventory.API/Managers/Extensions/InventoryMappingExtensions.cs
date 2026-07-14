@@ -13,6 +13,7 @@ public static class InventoryMappingExtensions
     {
         Sku = stockItem.Sku,
         OnHand = stockItem.OnHand,
+        UnitPrice = stockItem.UnitPrice,
         Reserved = stockItem.Reserved,
 
         // Read from the domain's computed property, so the view and the reserve decision can never
