@@ -1022,6 +1022,15 @@ PREFERRED — Do NOT:
 
 > Deltas from the Order template. Payment's reason to exist: idempotency against
 > duplicate callbacks, and clean decline handling.
+>
+> **Run Prompt B1 first**, substituting `OrderFlow.Payments.API` (PLURAL — see B1 [C])
+> and Payment's package list. D1 assumes the project already exists.
+>
+> Payment and Inventory look alike and are not. **Inventory guards a contended UPDATE
+> with a row version; Payment guards a contended INSERT with a unique index.** Payment
+> has no RowVersion, and that is a decision, not an omission — nothing updates a shared
+> payment row, so there is nothing to version. The race is two duplicates both trying to
+> CREATE the row, and only the database can adjudicate it.
 
 ## Prompt D1 — Payment domain + models 💬
 
@@ -1029,22 +1038,48 @@ PREFERRED — Do NOT:
 [S] Create:
     - `Managers/Domain/Payment.cs` — enum PaymentStatus { Pending=0, Captured=1,
       Declined=2, Refunded=3 }; class Payment: Id, OrderId, Amount (decimal),
-      Status, AuthorizationCode (string), IdempotencyKey (string), timestamps.
+      Status, AuthorizationCode (string), DeclineReason (string), IdempotencyKey
+      (string), timestamps.
     - ServiceModels exposing per-order payment attempt history for the ops view.
 
 [C] - Namespace `OrderFlow.Payments.API.Managers.Domain` — PLURAL. Singular
       `OrderFlow.Payment.API` plus the `Payment` entity above is the same CS0118
       namespace/type collision described in B1 [C].
     - All string properties initialized to `string.Empty`
+    - DeclineReason must be STORED, not recomputed. `PaymentDeclined.Reason` has to be
+      re-publishable verbatim when a duplicate ChargePayment is redelivered, and
+      re-running the decline rule to reproduce it means that if the configured threshold
+      moved in between, the replay yields a DIFFERENT reason — or approves a charge that
+      was previously declined.
+    - No RowVersion. Nothing updates a contended payment row; the contention is on the
+      INSERT and the unique index on IdempotencyKey settles it (D2).
+    - ServiceModel: mask the auth code (`AUTH-****3C4D`) and do NOT map IdempotencyKey.
+      [R]3 of D3 forbids LOGGING the code above Debug; putting it unmasked in a
+      browser-facing JSON response is a strictly wider exposure than the log line that
+      restriction exists to prevent. Publishing the idempotency key tells a caller exactly
+      what to send to collide with an existing charge on purpose.
 
 [R] CRITICAL — Do NOT:
     1. Accept or store any card data — no PAN, CVV, expiry, or name. This POC
        simulates authorization; there is nothing to store but amount + auth code.
+       Not masked, not encrypted, not "just for the demo". A field that does not exist
+       cannot leak, cannot be logged by accident, and cannot drag PCI scope into a
+       reference architecture.
     IMPORTANT — Do NOT:
     2. Default Status to anything but Pending on creation.
 
 [U] The Payment row is keyed for idempotency so a duplicate ChargePayment (or a
     duplicate provider callback) resolves to the SAME row and the SAME outcome.
+
+    NOTE — B8 sets `IdempotencyKey = order.Id.ToString("N")`, so an order can only ever
+    have ONE payment row and "attempt history" is that row's lifecycle
+    (Pending → Captured → Refunded), not a list of tries. That is what makes the ops view
+    diagnostic: TWO rows for one order means the guard failed and the customer was charged
+    twice. If you ever want genuinely retryable attempts, the key must vary per attempt
+    and B8 changes with it.
+
+    Also note `RefundPayment` carries no amount — refunds are all-or-nothing against the
+    capture. Partial refunds are not expressible in the contract.
 
 [B] N/A.
 ```
@@ -1052,19 +1087,51 @@ PREFERRED — Do NOT:
 ## Prompt D2 — Payment processing (idempotent charge) 🤖
 
 ```text
-[S] Create Data + Business for Payment. The method that matters:
+[S] Create Data + Business for Payment, plus `Managers/DataContext/PaymentDbContext.cs`
+    (the unique index that [R]1 depends on lives in its OnModelCreating, so it cannot be
+    a later prompt). The method that matters:
     ChargeAsync(Guid orderId, decimal amount, string idempotencyKey, ct):
-    1. If a Payment with this idempotencyKey already exists, return its existing
-       outcome UNCHANGED (no second charge).
-    2. Otherwise create Pending, simulate authorization (generate AUTH-XXXXXXXX, 8 hex),
-       and — for the demo — decline when a configurable rule says so (e.g. amount over a
-       threshold, or a "decline" SKU/flag) so the compensation path is demonstrable.
+    1. If a Payment with this idempotencyKey already exists AND has resolved, return its
+       existing outcome UNCHANGED (no second charge).
+    2. Otherwise INSERT a Pending row and let the unique index adjudicate — see [C].
+       Then simulate authorization (AUTH-XXXXXXXX, 8 hex) and — for the demo — decline
+       when a configurable rule says so (amount over a threshold, or a force-decline
+       flag) so the compensation path is demonstrable.
     3. Set Captured or Declined, persist, return the outcome.
     Also RefundAsync(Guid orderId, ct): flip a Captured payment to Refunded (idempotent).
 
-[C] - The idempotency key is derived from OrderId + the charge attempt so retries and
-      duplicate callbacks collapse to one row.
-    - Simulated auth only — generate the code in C#, no HTTP to a real processor.
+[C] - **The guard is the unique index, not the if-statement.** [S] step 1 as written is a
+      read-then-insert race: two duplicate callbacks arriving at the same instant both read
+      "no row", both authorize, both insert. No amount of C# in front of the database fixes
+      that. `HasIndex(x => x.IdempotencyKey).IsUnique()` in OnModelCreating is what makes it
+      correct — both racers insert, SQL rejects one (error 2601/2627 inside a
+      DbUpdateException), and the loser reads back the winner's row and returns the WINNER'S
+      outcome. Keep the existence check as the fast path for the common (sequential
+      redelivery) case, but understand it is an optimisation, not the guarantee. Drop the
+      index and "duplicate payment callback" stops being a no-op and starts being a second
+      charge.
+    - **A Pending row is not an outcome.** It means someone — us, a racer, or an attempt
+      that crashed between INSERT and the authorization — created the row and has not
+      recorded an answer. Resolving it is safe ONLY because the simulated authorization is
+      DETERMINISTIC in the idempotency key: every party resolving the same Pending row
+      computes the same code and the same decision, so a double-write writes identical
+      values. Derive the code as `AUTH-{SHA256(idempotencyKey) first 8 hex}`. A random
+      code satisfies "8 hex" and quietly breaks this: the row you end up with would depend
+      on how many times the message happened to be redelivered. A real processor gives you
+      this property by honouring the idempotency key server-side; simulate that contract
+      rather than pretending it does not exist.
+    - On the losing insert, DETACH the entity or the next SaveChanges retries it and throws
+      again.
+    - The idempotency key is supplied by the saga on ChargePayment and is stable across
+      every redelivery of it, so retries and duplicate callbacks collapse to one row.
+    - Simulated auth only — generate the code in C#, no HTTP to a real processor. Put it
+      behind an `IPaymentAuthorizer` so the "there is no processor here" boundary is
+      explicit and swappable.
+    - Decline rules live in a bound options class (`DeclineOverAmount`, default 1000;
+      `DeclineAll` for a live demo) — the failure-injection levers, not magic numbers.
+    - Amount is rounded ONCE, on entry to ChargeAsync, `MidpointRounding.AwayFromZero`.
+      Configure `HasPrecision(18, 2)` — left to convention EF picks a default and silently
+      truncates the scale it does not expect.
 
 [R] CRITICAL — Do NOT:
     1. Charge twice for the same idempotency key. A duplicate callback MUST be a no-op
@@ -1073,14 +1140,20 @@ PREFERRED — Do NOT:
     2. Call a real payment processor. Simulated authorization only.
     IMPORTANT — Do NOT:
     3. Treat a decline as an exception — it is a normal outcome that the saga
-       compensates. Publish PaymentDeclined, don't throw.
+       compensates. Publish PaymentDeclined, don't throw. DO throw on a MISSING
+       idempotency key: that is a broken caller, not a broken card, and without a key
+       there is nothing to collapse duplicates onto, so every retry becomes a fresh charge.
     4. Round the amount mid-calculation — round only at the boundary.
 
 [U] Called by the Payment consumer on ChargePayment / RefundPayment. Idempotency here
     is what makes at-least-once delivery safe for money.
 
 [B] When refunding, ONLY change Status and timestamps. Do NOT alter Amount, OrderId,
-    or AuthorizationCode.
+    or AuthorizationCode. The auth code is the only evidence tying the refund back to the
+    original capture — the thing an auditor asks to see. RefundAsync stays idempotent by
+    looking for a CAPTURED payment: no payment, a declined one, or an already-refunded one
+    finds nothing and quietly does nothing. A compensation that throws when it has nothing
+    to do dead-letters itself the second time the saga asks.
 ```
 
 ## Prompt D3 — Payment consumers + reply events + wiring 🤖
@@ -1093,13 +1166,47 @@ PREFERRED — Do NOT:
       event — it is compensation).
     - Facade, Controller (read-only: GET /api/Payments/order/{orderId:guid} attempt
       history), Program.cs referencing SQL + Service Bus.
+    - `PaymentDbInitializer` — EnsureCreated, called BEFORE app.Run(). No seed: every row
+      is created by a charge.
+
+[C] - Both consumers derive from `ServiceBusConsumer<T>` (A5) with SubscriptionName null:
+      charge-payment and refund-payment are QUEUES.
+    - **ChargePaymentConsumer overrides `MaxConcurrentCalls` to 4.** Same reasoning as C3:
+      "duplicate payment callback" is this service's failure-matrix row, and its hardest
+      form is two duplicates arriving at the SAME MOMENT — which a consumer pinned at 1
+      can never produce, so the unique-index race from D2 would never once be exercised.
+    - **The two idempotency guards are NOT redundant.** The base guards on (ConsumerName,
+      MessageId) — but that store is in-memory in the POC, so a restart forgets it. The
+      guard that protects the customer's money is D2's, keyed on ChargePayment.
+      IdempotencyKey and enforced by a unique index in SQL. The first is an optimisation;
+      the second is the guarantee. If you delete one, delete the first. Say so in the code,
+      because the layering invites a reviewer to notice "duplicate" is checked twice and
+      remove the expensive-looking database round trip — the wrong one.
+    - Reply events carry deterministic MessageIds:
+      `MessagingConventions.DeterministicMessageId(CorrelationId, nameof(PaymentSucceeded))`.
+    - Program.cs runs EnsureCreated BEFORE app.Run(). This matters more here than in
+      Inventory: EnsureCreated is what CREATES THE UNIQUE INDEX. Skip it and the service
+      still starts, still accepts charges, and looks entirely healthy — while having
+      silently lost its only real protection against a double charge. A missing table fails
+      loudly; a missing index fails only when it matters.
 
 [R] CRITICAL — Do NOT:
     1. Orchestrate. Payment replies with an event; it never calls Fulfillment or the
        saga directly.
-    2. Complete the ChargePayment message before the reply event publishes.
+    2. Complete the ChargePayment message before the reply event publishes. Publishing
+       inside HandleAsync gets this for free from the A5 base. Re-charging on the retry is
+       safe (the idempotency key resolves to the same row and returns the same outcome) and
+       the deterministic reply id makes the saga drop the duplicate — whereas settling
+       first and then failing to publish leaves the customer CHARGED and the saga waiting
+       forever for an answer nobody will send again.
     IMPORTANT — Do NOT:
-    3. Log the auth code above Debug level.
+    3. Log the auth code above Debug level. And do not return it unmasked from the
+       controller either — a JSON response is a wider exposure than the log line this rule
+       exists to prevent (browser cache, proxy logs, anyone's DevTools). Mask to the last 4.
+    4. Expose any endpoint that charges or refunds. The Facade is read-only. Money moves in
+       response to saga commands off the bus and nothing else; an HTTP write path is a
+       second, unauthenticated route to a customer's money that bypasses the idempotency
+       key, the unique index, and the compensation machinery entirely.
 
 [U] Payment hears ChargePayment / RefundPayment and answers with PaymentSucceeded /
     PaymentDeclined. Refund has no reply — fire-and-forget compensation.
@@ -1113,6 +1220,10 @@ PREFERRED — Do NOT:
 
 > Deltas. Fulfillment's reason to exist: resilient outbound calls to an unreliable
 > dependency, and clean dead-lettering on hard failure.
+>
+> **Run Prompt B1 first**, substituting `OrderFlow.Fulfillment.API` (singular — no
+> colliding entity) and its package list: bus only, no EF/SQL, no Cosmos/Redis.
+> E1 assumes the project already exists.
 
 ## Prompt E1 — Simulated carrier client with resilience 🤖
 
@@ -1183,6 +1294,13 @@ PREFERRED — Do NOT:
 > The smallest service, and a deliberate one. Its job is to prove a boundary:
 > notification NEVER blocks or rolls back the order (see Services & Responsibilities,
 > and Open Question re: whether it stays a separate service).
+>
+> **Run Prompt B1 first**, substituting `OrderFlow.Notification.API` (singular) and its
+> package list: bus only. F1 assumes the project already exists.
+>
+> Notification is the one service that consumes TOPICS, not queues — so its consumers
+> derive from `ServiceBusConsumer<T>` (A5) with `SubscriptionName => "notification"`, the
+> subscription the AppHost declares on payment-declined, order-confirmed and order-failed.
 
 ## Prompt F1 — Notification consumer (best-effort) 🤖
 

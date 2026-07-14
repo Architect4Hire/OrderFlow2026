@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>OrderFlow.Payments.API</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Contracts + ServiceDefaults only. A service never references another service —
+         they meet on the bus, never in the compiler. -->
+    <ProjectReference Include="..\OrderFlow.ServiceDefaults\OrderFlow.ServiceDefaults.csproj" />
+    <ProjectReference Include="..\OrderFlow.Contracts\OrderFlow.Contracts.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Brings EF Core + the SQL Server provider, and wires the "PaymentDb" connection string,
+         health check and telemetry from the AppHost. -->
+    <PackageReference Include="Aspire.Microsoft.EntityFrameworkCore.SqlServer" Version="13.3.0" />
+
+    <PackageReference Include="Azure.Messaging.ServiceBus" Version="7.20.1" />
+
+    <!-- Scalar renders an OpenAPI document; it does not produce one. In .NET 10 the generator
+         ships as a package, not in the shared framework, so Scalar alone gives a blank page. -->
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.9" />
+
+    <!-- Pinned above the 2.0.0 that Microsoft.AspNetCore.OpenApi drags in transitively: that
+         version carries GHSA-v5pm-xwqc-g5wc (high — circular schema references terminate OpenAPI
+         parsing), patched in 2.7.5. -->
+    <PackageReference Include="Microsoft.OpenApi" Version="2.7.5" />
+    <PackageReference Include="Scalar.AspNetCore" Version="2.16.11" />
+  </ItemGroup>
+
+</Project>
