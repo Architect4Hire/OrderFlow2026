@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/OrderFlow.AppHost/OrderFlow.AppHost.csproj" />
     <Project Path="src/OrderFlow.Contracts/OrderFlow.Contracts.csproj" />
+    <Project Path="src/OrderFlow.Inventory.API/OrderFlow.Inventory.API.csproj" />
     <Project Path="src/OrderFlow.Orders.API/OrderFlow.Orders.API.csproj" />
     <Project Path="src/OrderFlow.ServiceDefaults/OrderFlow.ServiceDefaults.csproj" />
   </Folder>

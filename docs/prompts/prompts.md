@@ -60,6 +60,15 @@ going live is a config change, not a rewrite.
   subscribers (topic/subscription).
 - Every message carries a `CorrelationId` (the OrderId) and a `MessageId`.
 - Consumers are idempotent: a durable processed-message key guards every handler.
+- EVERY consumer in EVERY service derives from `ServiceBusConsumer<TMessage>` in
+  ServiceDefaults (A5). It owns the settlement rules — abandon-don't-complete,
+  dead-letter poison, `(ConsumerName, MessageId)` — so no service can restate them
+  slightly differently. Override `SubscriptionName` for a topic (null = queue) and
+  `MaxConcurrentCalls` where concurrency is the behaviour under test.
+- A message emitted in RESPONSE to another (a reply event, a compensation command)
+  gets a deterministic MessageId — `MessagingConventions.DeterministicMessageId(
+  correlationId, nameof(TheMessage))`. A random id makes the retry's re-emitted reply
+  look brand new to the receiver's idempotency guard, and it is handled twice.
 - The Order service is the ONLY saga orchestrator. Other services react and reply;
   they never orchestrate.
 
@@ -273,10 +282,26 @@ PREFERRED — Do NOT:
       trace context onto every outgoing message.
     - `IdempotencyKeyStore.cs` — interface + a simple implementation recording
       processed (ConsumerName, MessageId) pairs so a redelivered message is a no-op.
+    - `MessagingConventions.cs` — `EntityNameFor<T>()` (kebab-case of the type name)
+      and `DeterministicMessageId(Guid correlationId, string discriminator)`
+      (SHA-256 of `"{correlationId:N}:{discriminator}"`, first 16 bytes).
+    - `ServiceBusConsumer.cs` — the abstract base EVERY consumer in EVERY service
+      derives from. Subclass supplies `HandleAsync(IServiceProvider scope, TMessage,
+      ct)`; the base owns processor setup, W3C trace re-parenting, the idempotency
+      guard, and settlement. Virtuals: `SubscriptionName` (null = queue, a name = topic
+      subscription) and `MaxConcurrentCalls` (default 1).
     - `MessagingExtensions.cs` — `AddOrderFlowMessaging(this IHostApplicationBuilder)`
       registering the bus and the idempotency store.
 
 [C] - Use the Azure.Messaging.ServiceBus SDK (works against the emulator unchanged).
+    - The consumer base is SHARED, not per-service. Three services consume commands off
+      queues and two consume events off topics; forked bases mean four near-identical
+      copies of the settlement rules, which is the last logic in this system you want
+      drifting. One class, one `SubscriptionName` virtual, covers both shapes.
+    - The base's ActivitySource must be named for the ENTRY ASSEMBLY, which is the
+      ApplicationName ServiceDefaults passes to `AddSource(...)`. Name it anything else
+      and the spans are silently dropped — every consumer hop vanishes from the
+      end-to-end trace that is supposed to prove the saga works.
     - Add PackageReference Aspire.Azure.Messaging.ServiceBus (13.3-aligned) and
       register the client with `builder.AddAzureServiceBusClient("servicebus")` so the
       connection string comes from the AppHost resource reference, never from config.
@@ -300,11 +325,15 @@ PREFERRED — Do NOT:
     2. Generate a NEW CorrelationId inside SendCommand/PublishEvent. Correlation flows
        from the originating OrderPlaced and never changes for that order.
     IMPORTANT — Do NOT:
-    3. Make the idempotency check optional per-call. Every consumer uses it (enforced
-       in the base consumer, Prompt B?/per-service).
+    3. Make the idempotency check optional per-call. Every consumer uses it — enforced
+       in `ServiceBusConsumer<T>` above, which is why the base lives HERE and not in
+       each service.
+    4. Complete/settle a message anywhere but in the base, after HandleAsync returns.
+       This is what lets a consumer publish its reply inside the handler and rely on a
+       failed publish redelivering the whole command.
 
-[U] The seam every service publishes and consumes through. Idempotency + correlation
-    live here so no individual consumer can forget them.
+[U] The seam every service publishes and consumes through. Idempotency, correlation and
+    settlement live here so no individual consumer can forget them.
 
 [B] N/A — new files.
 ```
@@ -333,8 +362,20 @@ PREFERRED — Do NOT:
       `Order` binds to the enclosing NAMESPACE, not the class, and a normally-placed
       `using` cannot win. Same trap for Payment → use OrderFlow.Payments.API.
       Inventory/Fulfillment/Notification have no colliding entity and stay singular.
-    - PackageReferences: Aspire.Microsoft.Azure.Cosmos, Aspire.StackExchange.Redis,
-      Azure.Messaging.ServiceBus, Scalar.AspNetCore
+    - PackageReferences, every service: Azure.Messaging.ServiceBus,
+      Scalar.AspNetCore, Microsoft.AspNetCore.OpenApi, Microsoft.OpenApi (>= 2.7.5)
+        · Scalar RENDERS an OpenAPI document; it does not PRODUCE one. In .NET 10 the
+          generator ships as a package, not in the shared framework, so Scalar without
+          Microsoft.AspNetCore.OpenApi + AddOpenApi()/MapOpenApi() is a blank page.
+        · Microsoft.OpenApi must be pinned EXPLICITLY. Microsoft.AspNetCore.OpenApi
+          10.0.9 drags in 2.0.0 transitively, which carries GHSA-v5pm-xwqc-g5wc (high:
+          circular schema references terminate OpenAPI parsing), patched in 2.7.5.
+          Without the pin the build raises NU1903.
+    - PackageReferences, per service (least privilege — only what it actually uses):
+        · Orders:    Aspire.Microsoft.Azure.Cosmos, Aspire.StackExchange.Redis
+        · Inventory: Aspire.Microsoft.EntityFrameworkCore.SqlServer
+        · Payments:  Aspire.Microsoft.EntityFrameworkCore.SqlServer
+        · Fulfillment / Notification: neither — bus only
     - ProjectReference to ../OrderFlow.ServiceDefaults AND ../OrderFlow.Contracts
 
 [R] CRITICAL — Do NOT:
@@ -620,6 +661,16 @@ PREFERRED — Do NOT:
       not from an in-memory field, so it survives restarts.
     - Transitions are guarded: an event for an order already in a terminal state is a
       no-op (idempotent — a redelivered event must not re-fire compensation).
+    - ONLY OrderConfirmed and OrderFailed are terminal. InventoryRejected,
+      PaymentDeclined and FulfillmentFailed are the CAUSE, not the conclusion: they
+      record a reason and leave the order non-terminal until the compensations are away.
+    - Send every outbound message BEFORE recording the terminal state. The terminal
+      guard is what makes a redelivery a no-op — record Failed first and a retry of the
+      same event is guarded out before it can re-send the compensation, which strands
+      the stock the guard was supposed to protect.
+    - Every emitted message gets `MessagingConventions.DeterministicMessageId(orderId,
+      nameof(TheMessage))` so a replay is deduped by the receiver's (ConsumerName,
+      MessageId) guard rather than issuing a second refund.
     - All state changes for an order funnel through this class — the ONE auditable
       place transitions happen.
 
@@ -651,8 +702,19 @@ PREFERRED — Do NOT:
     PaymentDeclined, FulfillmentDispatched, FulfillmentFailed. Each consumer:
     checks the idempotency store, then delegates to the matching IOrderSaga method.
 
-[C] - Consumers are thin: idempotency guard → saga call → mark processed. No business
-      logic in the consumer itself.
+[C] - Each consumer derives from `ServiceBusConsumer<TEvent>` (A5) and overrides
+      `SubscriptionName => "order-saga"` — these six read TOPIC SUBSCRIPTIONS, not
+      queues. The base already owns the idempotency guard, settlement and tracing, so
+      each subclass is one expression-bodied HandleAsync delegating to the saga. If one
+      of them ever grows an `if`, the layering has broken.
+    - Leave `MaxConcurrentCalls` at the default of 1. The saga mutates one order's
+      stream per event and there is nothing to gain from racing it (contrast C3, where
+      concurrency IS the behaviour under test).
+    - PENDING: B9 was built before the shared base existed, so the code still carries a
+      local `OrderSagaConsumer<T>` that duplicates it. Folding it onto
+      `ServiceBusConsumer<T>` is a one-line change (`SubscriptionName => "order-saga"`)
+      and deletes the copy. Until then, two near-identical settlement implementations
+      exist and can drift.
     - Register consumers as hosted background processors over the Service Bus
       subscriptions declared in the AppHost.
 
@@ -674,13 +736,18 @@ PREFERRED — Do NOT:
 ## Prompt B10 — Order controller 🤖
 
 ```text
-[S] Create `Controllers/OrderController.cs`:
-    POST /api/Orders                → place an order (201 CreatedAtAction, returns
+[S] Create `Controllers/OrdersController.cs`:
+    POST /api/Orders                → place an order (201 CreatedAtRoute, returns
                                        OrderServiceModel with State=Placed).
     GET  /api/Orders/{id:guid}      → current status (404 if unknown).
     GET  /api/Orders/active         → ops list of non-terminal orders.
 
 [C] - [ApiController], [Route("api/[controller]")], [Produces("application/json")]
+    - OrdersController, PLURAL — `[controller]` strips only the "Controller" suffix, so
+      OrderController would route to /api/Order and every client path would be wrong.
+    - 201 via `CreatedAtRoute` with a named route, NOT `CreatedAtAction(nameof(...))`:
+      MVC strips the "Async" suffix from action names, so nameof(GetStatusAsync) looks
+      for an action that does not exist and throws at RUNTIME, not compile time.
     - Inject IOrderFacade via primary constructor
     - ProducesResponseType attributes for Swagger
 
@@ -713,6 +780,14 @@ PREFERRED — Do NOT:
       dropped — most of all the Cosmos camelCase serializer (B5 [C]), without which
       every append fails on a partition-key mismatch.
     - The API-reference UI is Scalar (`Scalar.AspNetCore`, per B1), not Swashbuckle.
+      It needs `AddOpenApi()` + `MapOpenApi()` beside `MapScalarApiReference()` —
+      Scalar renders a document it does not generate. Without them: a blank page.
+    - CORS origin from configuration (`WebOrigin`), defaulting to
+      http://localhost:4200. `AllowAnyOrigin` is not merely against [R]1 — combined
+      with AllowCredentials it is illegal and throws at startup.
+    - The registration ORDER is [R]2: the three infrastructure extensions, THEN
+      AddOrderConsumers(). The consumers are hosted services that start pulling the
+      moment the host starts.
 
 [R] CRITICAL — Do NOT:
     1. Allow CORS from `*` — only the web origin.
@@ -735,6 +810,22 @@ PREFERRED — Do NOT:
 > Same onion layering as Order (B1→B11 minus the saga/read-model), different domain.
 > Below are the **deltas**. Inventory's whole reason to exist is proving no-oversell
 > under contention.
+>
+> **Run Prompt B1 first**, substituting `OrderFlow.Inventory.API` (singular — no
+> `Inventory` entity, so no CS0118) and Inventory's package list. C1 assumes the
+> project already exists; there is no separate skeleton prompt for it.
+>
+> **Open question, decide before C1.** `ReservationState` is `{ Held, Released }` and
+> the contracts have `ReserveInventory` / `ReleaseInventory` — but NOTHING tells
+> Inventory the goods shipped. On the happy path the hold stays `Held` forever and
+> `OnHand` is never decremented. The arithmetic survives (`Available = OnHand -
+> Reserved` is unchanged either way), but the ops view fills with `Held` rows that
+> shipped weeks ago sitting next to `Held` rows stranded by a lost compensation — the
+> same colour on screen, and telling them apart is the entire diagnostic this POC
+> exists to demonstrate. Either add `Consumed = 2` plus a `CommitInventory` command
+> (A2 contract + ~4 lines in B8's OnFulfillmentDispatched, alongside the confirm — same
+> shape as OnFulfillmentFailed already sending two commands), or record it as an
+> explicit POC simplification in an ADR. Do not leave it implicit.
 
 ## Prompt C1 — Inventory domain + models 💬
 
@@ -750,15 +841,30 @@ PREFERRED — Do NOT:
 [C] - Namespace `OrderFlow.Inventory.API.Managers.Domain`
     - RowVersion is the EF concurrency token (`[Timestamp]`-equivalent configured in
       OnModelCreating, NOT via attribute — config lives in the context).
+    - Sku is the natural key. No surrogate id: the bus talks in SKUs, so an int id
+      would be a second identity for the same thing and a join for nothing.
+    - `Available` is get-only with no backing field, so EF ignores it by convention —
+      but the DbContext still calls `Ignore(...)` explicitly (C2). Relying on a
+      convention to keep a computed value out of a table is how a second source of
+      truth appears quietly on an EF upgrade.
+    - One Reservation row per (order, SKU), not per order: `ReleaseInventory` carries
+      only the CorrelationId, so `OrderId` is the ONLY handle Inventory gets for undoing
+      a hold. It is the column that gets the index.
+    - `Released` is a tombstone, not a delete — a redelivered release must be able to
+      see the hold is already gone and no-op instead of releasing stock twice.
 
 [R] CRITICAL — Do NOT:
     1. Model Available as a stored column — it is derived. Storing it invites the two
        fields to disagree.
     IMPORTANT — Do NOT:
     2. Add validation attributes to Domain.
+    3. Put transition logic (Held→Released, and the matching Reserved decrement) on the
+       entity. It belongs in Business, in one transaction with the stock move. Marking a
+       reservation Released without moving the stock level IS the silent-stock-loss bug.
 
 [U] StockItem is the contended row. Reservation records what the saga is holding so
-    a later ReleaseInventory can find and undo exactly the right hold.
+    a later ReleaseInventory can find and undo exactly the right hold. A hold that
+    never got a Reservation row is stock nobody can ever release.
 
 [B] N/A.
 ```
@@ -775,9 +881,48 @@ PREFERRED — Do NOT:
     Also ReleaseAsync(Guid orderId, ct): flip this order's Held reservations to
     Released and decrement Reserved accordingly.
 
-[C] - Use EF Core optimistic concurrency: on DbUpdateConcurrencyException, reload and
-      retry a bounded number of times, then fail the line.
+    Also create `Managers/DataContext/InventoryDbContext.cs` — the RowVersion config
+    that [R]1 depends on lives in its OnModelCreating, so it cannot be a later prompt.
+
+[C] - `stockItem.Property(x => x.RowVersion).IsRowVersion()` is THE load-bearing line
+      of the whole service. It is what turns every stock write into
+      `UPDATE StockItems SET Reserved=@new WHERE Sku=@sku AND RowVersion=@loaded`.
+      Delete it and EF emits an unconditional UPDATE, both writers win, the SKU
+      oversells, and nothing else in this prompt matters. Also: `Ignore(x => x.Available)`
+      (C1), `HasKey(x => x.Sku)`, `HasIndex(OrderId, State)` on Reservation, and store
+      ReservationState via `HasConversion<string>()` so the value is readable in the
+      table during a demo and renumbering the enum cannot reinterpret old rows.
+    - Use EF Core optimistic concurrency: on DbUpdateConcurrencyException, reload and
+      RE-DECIDE — never reload and re-apply. The obvious implementation is wrong in a
+      way that looks right: catch, reload, redo the same `Reserved += qty`, save. That
+      reapplies a decision made against stock that has since moved — the oversell race
+      with extra steps. Re-read, re-check `Available >= Qty`, and be fully prepared to
+      come back with a rejection on the second pass. Losing the race is SUPPOSED to be
+      able to change the answer.
+    - The Reserved increment and the Reservation row go in the SAME SaveChangesAsync,
+      so they share one transaction. Split them and a crash in between leaves stock held
+      with no record of who holds it — unreleasable and invisible.
+    - On DbUpdateConcurrencyException the Reservation you Added is still sitting in the
+      change tracker as Added. DETACH it, or the NEXT line's SaveChanges quietly inserts
+      it: a hold recorded against stock that was never reserved.
+    - ReleaseAsync: group the order's Held reservations BY SKU and commit each group's
+      stock decrement and tombstones together. A crash mid-release must never leave stock
+      given back with the reservations still Held — the next redelivery would give the
+      same stock back a second time.
+    - Clamp Reserved at zero on release and log an ERROR if it would have gone negative
+      ([R]3). A negative Reserved makes Available exceed OnHand and means a hold was
+      released twice somewhere.
+    - Return an OUTCOME enum from the Data layer (Held / InsufficientStock / UnknownSku /
+      ConcurrencyExhausted), not a bool, so InventoryRejected.Reason can say which.
     - All-or-nothing per order: either every line is reserved or none remain held.
+    - ReserveAsync begins by releasing any holds the order already carries — idempotency
+      by reset. The consumer's (ConsumerName, MessageId) guard covers the normal
+      redelivery, but the POC's idempotency store is in-memory, so a restart loses it;
+      and no guard can help with a crash BETWEEN lines, which leaves real holds behind
+      that no idempotency record ever knew about. Reserve from a known-empty state.
+    - The intra-call unwind ([R]2) must reuse the SAME ReleaseAsync the saga's
+      compensation calls. One release path, exercised on every rejected order rather
+      than only on the rare compensation, so it cannot rot unnoticed.
 
 [R] CRITICAL — Do NOT:
     1. Use a `SELECT` then unconditional `UPDATE` without the RowVersion check — that
@@ -789,8 +934,12 @@ PREFERRED — Do NOT:
        the loser gets a clean rejection, never a negative Available.
     IMPORTANT — Do NOT:
     4. Retry infinitely on concurrency conflict — bound it, then reject the line.
+       Accept the consequence: under heavy contention a line with real stock can be
+       rejected as ConcurrencyExhausted. That is the honest trade, and the reason string
+       must distinguish it from genuine exhaustion.
     5. Throw for "insufficient stock" — that is a normal business outcome (rejection),
-       not an exception.
+       not an exception. DO throw if the RELEASE itself fails: a tidy rejection returned
+       while stock is still held would settle the message and make the leak permanent.
 
 [U] Called by the Inventory consumer when it receives ReserveInventory. This is the
     "Concurrent purchase of the last unit" row of the Failure matrix — the thing you
@@ -810,15 +959,55 @@ PREFERRED — Do NOT:
     - Facade, Controller (read-only ops endpoints: GET /api/Inventory for per-SKU
       availability), and Program.cs mirroring the Order wiring but referencing SQL +
       Service Bus (no Cosmos/Redis).
+    - `InventoryDbInitializer` — EnsureCreated + seed, called BEFORE app.Run().
+
+[C] - Both consumers derive from `ServiceBusConsumer<T>` (A5) and leave SubscriptionName
+      null: reserve-inventory and release-inventory are QUEUES (commands, one handler),
+      not topics.
+    - **ReserveInventoryConsumer overrides `MaxConcurrentCalls` to 8.** Left at the
+      default of 1, this service handles reservations strictly one at a time, two orders
+      for the last unit NEVER overlap, and the row-version guard that C2 is entirely
+      built around does not fire once. The concurrency demo passes for the wrong reason
+      and proves nothing. Contention is the behaviour under test, so the consumer has to
+      be able to contend with itself. Safe because each message gets its own DI scope
+      and therefore its own DbContext. This is the ONLY consumer in the system that is
+      deliberately not serialized.
+    - The reply events carry deterministic MessageIds:
+      `MessagingConventions.DeterministicMessageId(CorrelationId, nameof(InventoryReserved))`.
+      Random ids and a retry's re-emitted reply looks brand new to the saga's guard,
+      which then advances the order twice.
+    - The consumer publishes the reply directly (Business returns a ReservationResult
+      and does not touch the bus). This DIVERGES from Orders, where Business owns
+      IMessageBus — a deliberate call, because here the consumer is the port that
+      translates a decision onto the wire. Note it, or move it, but do not let the two
+      services differ by accident.
+    - Program.cs must create the schema and seed stock BEFORE `app.Run()` — hosted
+      services start inside Run(), so this is what stops the reserve consumer taking its
+      first message against a database with no tables. Seed only when empty (the AppHost
+      gives SQL a persistent volume precisely so levels survive a restart). Include one
+      SKU with OnHand = 1: without a last unit there is no last-unit demo. EnsureCreated,
+      not migrations — right for a disposable POC container, wrong the moment the schema
+      must change without losing data. Leave the TODO.
 
 [R] CRITICAL — Do NOT:
     1. Orchestrate. Inventory replies with an event; it never calls Payment or the
        saga directly.
     2. Complete the ReserveInventory message before the reply event is published — if
        publish fails, let the message retry so the saga is never left waiting silently.
+       The asymmetry is the point: publish-then-fail-to-settle is SAFE (the command
+       redelivers, Inventory re-reserves from a clean state, and the deterministic
+       MessageId makes the saga drop the duplicate reply). Settle-then-fail-to-publish
+       is unrecoverable — stock held, saga waiting forever on an answer nobody will send
+       again. Publishing inside HandleAsync gets this for free from the A5 base.
     IMPORTANT — Do NOT:
     3. Make ReleaseInventory fail loudly on an already-released order — releasing an
-       order with no active holds is a valid no-op (idempotent compensation).
+       order with no active holds is a valid no-op (idempotent compensation). A
+       compensation that throws when it has nothing to do dead-letters itself out of
+       existence the second time it is asked, which is exactly how stock gets stranded.
+    4. Expose any endpoint that reserves or releases stock over HTTP. The Facade is
+       read-only. Stock moves in response to saga commands off the bus and nothing else;
+       an HTTP write path is a second, unaudited way around the whole compensation and
+       idempotency machinery.
 
 [U] Inventory hears ReserveInventory / ReleaseInventory from the saga and answers with
     InventoryReserved / InventoryRejected. Release has no reply — it is fire-and-forget

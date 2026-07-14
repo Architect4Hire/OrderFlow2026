@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text;
 using OrderFlow.Contracts.Messages;
 
@@ -24,6 +25,24 @@ public static class MessagingConventions
     /// <inheritdoc cref="EntityNameFor(Type)"/>
     public static string EntityNameFor<TMessage>() where TMessage : MessageBase
         => EntityNameFor(typeof(TMessage));
+
+    /// <summary>
+    /// A MessageId derived from what the message MEANS rather than when it was created: the same
+    /// (correlation, discriminator) pair always yields the same id.
+    /// </summary>
+    /// <remarks>
+    /// This is what makes a retry safe. Redeliver a command and the sender re-emits its reply — with
+    /// a random id that reply looks brand new to the receiver's <c>(ConsumerName, MessageId)</c>
+    /// guard and gets handled twice. Derived from the order id and the message name, the duplicate
+    /// is recognised and dropped. Use the message type name as the discriminator unless one order
+    /// can legitimately produce two of the same message.
+    /// </remarks>
+    public static Guid DeterministicMessageId(Guid correlationId, string discriminator)
+    {
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes($"{correlationId:N}:{discriminator}"));
+
+        return new Guid(hash.AsSpan(0, 16));
+    }
 
     private static string ToKebabCase(string name)
     {
