@@ -89,6 +89,15 @@ public abstract class ServiceBusConsumer<TMessage>(
     /// </summary>
     protected abstract Task HandleAsync(IServiceProvider services, TMessage message, CancellationToken cancellationToken);
 
+    /// <summary>How long to keep trying to attach to the broker before giving up and taking the host down.</summary>
+    /// <remarks>
+    /// Generous on purpose. The cost of waiting too long is a slow start; the cost of giving up too early
+    /// is a dead service. Only the second one wakes anybody up.
+    /// </remarks>
+    private static readonly TimeSpan StartupConnectBudget = TimeSpan.FromSeconds(90);
+
+    private static readonly TimeSpan MaximumConnectBackoff = TimeSpan.FromSeconds(5);
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         // Same convention the publisher used, so a renamed contract breaks both ends together
@@ -109,11 +118,88 @@ public abstract class ServiceBusConsumer<TMessage>(
         _processor.ProcessMessageAsync += OnMessageAsync;
         _processor.ProcessErrorAsync += OnProcessorErrorAsync;
 
-        logger.LogInformation(
-            "{Consumer} listening on {Entity}{Subscription} with concurrency {Concurrency}",
-            ConsumerName, entityName, SubscriptionName is null ? string.Empty : $"/{SubscriptionName}", MaxConcurrentCalls);
+        await StartProcessingWithRetryAsync(entityName, stoppingToken).ConfigureAwait(false);
+    }
 
-        await _processor.StartProcessingAsync(stoppingToken).ConfigureAwait(false);
+    /// <summary>
+    /// Attaches to the broker, retrying while it is merely NOT READY YET, and rethrowing once it is
+    /// clear it never will be.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>A bare <c>StartProcessingAsync</c> here is a coin flip that takes the whole service with it.</b>
+    /// An unhandled exception in a <see cref="BackgroundService"/> stops the host
+    /// (<c>BackgroundServiceExceptionBehavior.StopHost</c>, the .NET default and the right one), so a
+    /// single consumer that cannot attach kills the entire API. Aspire's <c>WaitFor</c> does not close
+    /// this window: it waits on the broker's CONTAINER health check, and the Service Bus emulator accepts
+    /// TCP before it has finished materialising queues, topics and subscriptions from its config. Connect
+    /// in that gap and you get a communication error or MessagingEntityNotFound.
+    /// </para>
+    /// <para>
+    /// The odds scale with consumer count, which is why this surfaced as "the Orders API randomly does
+    /// not start": Orders attaches SIX processors, Fulfillment one. Six rolls of the dice against one.
+    /// It failed roughly one start in six, and — because the host simply exited — the AppHost logged
+    /// nothing at all. The other four services came up healthy, so the only symptom was a dead front page.
+    /// </para>
+    /// <para>
+    /// <b>Retrying is the fix; swallowing is NOT.</b> Catching this and carrying on would leave the host
+    /// alive with a consumer that never attached — messages piling up in a queue nobody is reading, no
+    /// error anywhere, an order that simply stops moving. That is strictly worse than crashing, and it is
+    /// the exact silent-failure class this system exists to eliminate. So: retry while it looks like a
+    /// race, and if the budget runs out, <b>rethrow and let the host die loudly</b> — because by then it
+    /// is not a race, it is a misconfiguration (an entity the AppHost never declared), and a service that
+    /// cannot consume its own queue has no business reporting Healthy.
+    /// </para>
+    /// </remarks>
+    private async Task StartProcessingWithRetryAsync(string entityName, CancellationToken stoppingToken)
+    {
+        var target = SubscriptionName is null ? entityName : $"{entityName}/{SubscriptionName}";
+        var deadline = DateTime.UtcNow + StartupConnectBudget;
+        var backoff = TimeSpan.FromMilliseconds(250);
+
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                await _processor!.StartProcessingAsync(stoppingToken).ConfigureAwait(false);
+
+                // Logged only once it is TRUE. Announcing "listening" before the attach succeeded is how
+                // a dead consumer ends up with a reassuring log line above it.
+                logger.LogInformation(
+                    "{Consumer} listening on {Target} with concurrency {Concurrency} (attempt {Attempt})",
+                    ConsumerName, target, MaxConcurrentCalls, attempt);
+
+                return;
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                // Shutting down mid-attach is not a failure.
+                throw;
+            }
+            catch (Exception ex) when (DateTime.UtcNow < deadline)
+            {
+                logger.LogWarning(
+                    ex,
+                    "{Consumer} could not attach to {Target} (attempt {Attempt}). The broker may still be starting. Retrying in {Backoff}.",
+                    ConsumerName, target, attempt, backoff);
+
+                await Task.Delay(backoff, stoppingToken).ConfigureAwait(false);
+
+                backoff = TimeSpan.FromTicks(Math.Min(backoff.Ticks * 2, MaximumConnectBackoff.Ticks));
+            }
+            catch (Exception ex)
+            {
+                // Budget exhausted. This is no longer a startup race — the entity is missing, the
+                // connection string is wrong, or the broker is genuinely down. Take the host with us:
+                // a service that cannot read its own queue must not sit there looking healthy.
+                logger.LogCritical(
+                    ex,
+                    "{Consumer} gave up attaching to {Target} after {Budget}. Stopping the host — this service cannot do its job.",
+                    ConsumerName, target, StartupConnectBudget);
+
+                throw;
+            }
+        }
     }
 
     private async Task OnMessageAsync(ProcessMessageEventArgs args)

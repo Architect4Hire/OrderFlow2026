@@ -1,0 +1,29 @@
+{
+  "name": "orderflow-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OrderFlow customer + ops surfaces. Angular 20, standalone, no UI library.",
+  "scripts": {
+    "postinstall": "node scripts/write-config.mjs",
+    "start": "node scripts/start.mjs",
+    "build": "ng build",
+    "ng": "ng"
+  },
+  "dependencies": {
+    "@angular/common": "20.3.26",
+    "@angular/compiler": "20.3.26",
+    "@angular/core": "20.3.26",
+    "@angular/forms": "20.3.26",
+    "@angular/platform-browser": "20.3.26",
+    "@angular/router": "20.3.26",
+    "rxjs": "~7.8.2",
+    "tslib": "^2.3.0",
+    "zone.js": "~0.15.1"
+  },
+  "devDependencies": {
+    "@angular/build": "20.3.32",
+    "@angular/cli": "20.3.32",
+    "@angular/compiler-cli": "20.3.26",
+    "typescript": "~5.8.3"
+  }
+}

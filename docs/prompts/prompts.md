@@ -8,11 +8,12 @@
 > Parts A–H build the system prompt by prompt. **Part K then fixes it**, and the fixes are not
 > cosmetic — they are the difference between a system that looks right and one that survives its
 > own failure matrix. The three that matter most:
+> 
 > - **The AppHost could never start.** Not once, from A3 to F1. Every prompt ended on a green
 >   `dotnet build`, and a green build is not a running system. (H1)
 > - **The customer set the price they were charged.** (ADR-006 / K3)
 > - **A failed send at the front door stranded an order permanently and silently.** (ADR-007 / K1)
->
+> 
 > None of those were caught by building, and none would have been caught by a demo of the happy
 > path. Run **K1 before you demo anything**, and **K4** so the failure matrix is executable rather
 > than a table in a document.
@@ -211,7 +212,11 @@ PREFERRED — Do NOT:
       Aspire.Hosting.Azure.CosmosDB, Aspire.Hosting.Redis,
       Aspire.Hosting.Azure.ServiceBus, Aspire.Hosting.JavaScript (all 13.3-aligned).
       (NOT Aspire.Hosting.NodeJs — it stops at 9.5.2 and has no 13.x release.)
-    - SQL password via `builder.AddParameter("sql-password", secret: true)`.
+    - SQL Server: `builder.AddSqlServer("sql")` with NO password parameter. Passing none
+      makes Aspire generate a random administrator password and persist it to USER
+      SECRETS (the AppHost declares a UserSecretsId), so it is stable across runs, unique
+      per machine, and never enters the repository — and a fresh clone still comes up on
+      `dotnet run` with no setup step. See [R]1.
     - SQL Server: `.WithDataVolume("orderflow-sql-data")
       .WithLifetime(ContainerLifetime.Persistent)`.
     - Cosmos: use the Cosmos DB EMULATOR (`.RunAsEmulator(...)`), NOT a live account.
@@ -221,10 +226,12 @@ PREFERRED — Do NOT:
       Point the Order API at the CONTAINER resource, not the database (Prompt B5).
     - Service Bus: use the Service Bus EMULATOR (`.RunAsEmulator(...)`). Declare the
       queues (per-command) and topics+subscriptions (per-event) the services need.
-      OPEN: the `order-placed` topic currently has no subscriber AND no publisher —
-      B7 appends OrderPlaced to the event store but never publishes it. Either have
-      Business also `PublishEventAsync(orderPlaced)`, or drop the topic. Right now it is
-      dead infrastructure.
+      RESOLVED — DROP the `order-placed` topic. It had no subscriber AND no publisher:
+      B7 appends OrderPlaced to the event store and never publishes it; the audit trail is
+      the event log (ADR-002). It was not merely dead infrastructure — **the Service Bus
+      emulator refuses to start a topic with zero subscriptions ("At least one subscription
+      required per topic") and exits 139 (SIGSEGV)**, so this one unused line took down the
+      entire message bus, and with it every service. Found only by running the AppHost (H1).
     - Each API: `.WithReference(<its resources>).WaitFor(<its resources>)
       .WithExternalHttpEndpoints()`. Order API references Cosmos + Redis + Service Bus;
       Inventory + Payment reference SQL + Service Bus; Fulfillment + Notification
@@ -239,12 +246,22 @@ PREFERRED — Do NOT:
       (ASPIRE_DASHBOARD_OTLP_ENDPOINT_URL, ASPIRE_RESOURCE_SERVICE_ENDPOINT_URL),
       with distinct ports across profiles. Without this file, `dotnet run`
       returns immediately with no dashboard — a silent no-op.
-    - `appsettings.Development.json` may include a `Parameters:sql-password` fallback
-      so first-time `dotnet run` succeeds without a manual `dotnet user-secrets set`.
+    - `appsettings.Development.json` holds the failure-injection parameters (H1) and
+      NOTHING that is a credential.
 
 [R] CRITICAL — Do NOT:
-    1. Hard-code the SQL password — use AddParameter with secret:true (a dev-only
-       fallback in appsettings.Development.json is acceptable).
+    1. Put the SQL password anywhere in the repository — not in Program.cs, and NOT as a
+       "dev-only fallback" in appsettings.Development.json. Let Aspire generate it
+       (AddSqlServer with no password parameter); it lands in user secrets, outside the
+       tree.
+
+       **This restriction used to end with "(a dev-only fallback in
+       appsettings.Development.json is acceptable)", and that parenthetical is how a
+       password ended up committed to a public repo.** It permitted the exact thing the
+       rule forbids. `secret: true` stops a value being LOGGED; it says nothing about
+       where you chose to write it down, and a parameter marked secret whose value sits in
+       a tracked JSON file is theatre. The password was real enough to fail the rule and
+       harmless enough that nobody looked twice — which is precisely how this happens.
     2. Point Cosmos or Service Bus at a LIVE Azure resource. Emulators only — the
        whole POC is zero-spend (ADR-005). Leave a `// TODO: swap RunAsEmulator for
        live account via config` comment at each.
@@ -891,7 +908,7 @@ PREFERRED — Do NOT:
 > but the ops view fills with `Held` rows for orders that shipped weeks ago, sitting next to `Held`
 > rows stranded by a lost compensation — the same colour on screen. Telling those apart is the
 > entire diagnostic this POC exists to demonstrate.
->
+> 
 > **Inventory also owns the CATALOGUE.** `StockItem` carries `UnitPrice`, and it is the only price
 > in the system. It travels back to the saga on `InventoryReserved`, and that is the number the
 > customer is charged. The client sends no price at all (ADR-006).
@@ -1417,22 +1434,62 @@ PREFERRED — Do NOT:
 
 ## Prompt G1 — Angular workspace scaffold 🤖
 
+> **[R]4 named the package that installs the thing it forbids.** `@angular-devkit/build-angular`
+> v20 hard-depends on `webpack@5.105.0`, `webpack-dev-server`, `@ngtools/webpack` and `karma` —
+> 54 dependencies. Its `:application` target is esbuild-based, so the *letter* of "do not use the
+> Webpack builder" is satisfiable, but the package drags the entire Webpack toolchain into
+> `node_modules` regardless. **`@angular/build:application`** is Angular 20's canonical
+> esbuild/Vite builder and contains no webpack at all. It honours [R]4's intent where the named
+> package undercuts it. Corrected in [C]/[R] below.
+> 
+> **The browser cannot read an environment variable — and `environment.ts` cannot bridge that gap.**
+> The [C] line "environment.ts with the URLs (from the AppHost-provided env vars)" describes
+> something Angular does not do. `environment.ts` is compiled *into the bundle*, so a value read
+> from `process.env` there freezes whatever port Aspire assigned on the build that produced the
+> bundle — and Aspire assigns a different one next run. The URLs have to cross the process/browser
+> boundary as a **file**: `scripts/write-config.mjs` writes `public/config.js`, `index.html` loads
+> it before the bundle, and `environment.ts` reads the resulting global. Same mechanism serves the
+> nginx image (`docker-entrypoint.sh`), so one image is repointable without a rebuild.
+> 
+> **The TypeScript rationale is stale; the instruction is still right.** The real peer range on
+> `@angular/build` 20.3.x is `>=5.8 <6.0`, not `>=5.8.0 <5.9.0`. Pinning `~5.8.3` satisfies it, and
+> [R]3 is correct that 5.6/5.7 will throw — just not for the range stated.
+> 
+> **Node floor:** Angular 20 requires `^20.19 || ^22.12 || ^24`. The Dockerfile's `node:22-alpine`
+> is fine; a local Node 20.18 is not.
+
 ```text
 [S] Create `src/OrderFlow.Web/` with: package.json (Angular 20, start script using
     PORT env var defaulting to 4200), angular.json (application builder, standalone),
     tsconfig(.app).json (strict), src/main.ts (bootstrapApplication), src/index.html,
-    src/styles.css with the CSS variables in [C], and a Dockerfile
-    (node:22-alpine → nginx:alpine).
+    src/styles.css with the CSS variables in [C], scripts/write-config.mjs +
+    scripts/start.mjs (see [C]), and a Dockerfile (node:22-alpine → nginx:alpine)
+    with nginx.conf (SPA try_files fallback) and docker-entrypoint.sh.
+
+    THEN: uncomment the `AddJavaScriptApp("web", "../OrderFlow.Web", "start")` resource
+    in `src/OrderFlow.AppHost/Program.cs`. H1 deliberately deferred it to here, because
+    the call resolves its directory EAGERLY and the workspace above is what makes it
+    resolvable. Add `.WithNpm()` so a fresh clone installs packages and comes up on
+    `dotnet run` alone. This is the step that makes ADR-005's headline claim true.
 
 [C] - Standalone components only. NO NgModules. bootstrapApplication(AppComponent,
       appConfig).
-    - Pin `"typescript": "~5.8.0"` (Angular 20 peer range >=5.8.0 <5.9.0; older pins
-      throw verifySupportedTypeScriptVersion at build).
+    - Builder: `@angular/build:application` (+ `@angular/build:dev-server`). This is
+      Angular 20's esbuild/Vite builder. Do NOT use @angular-devkit/build-angular —
+      see [R]4.
+    - Pin `"typescript": "~5.8.3"` (real peer range on @angular/build 20.3.x is
+      >=5.8 <6.0; 5.6/5.7 throw verifySupportedTypeScriptVersion at build).
+    - Angular framework packages at 20.3.x, tooling (@angular/build, @angular/cli) at
+      20.3.3x, zone.js ~0.15.1 (core peers ~0.15.0 — 0.16.x violates it), rxjs ~7.8.
     - CSS variables in the Architect4Hire palette: --bg-deep #1a1a1a,
       --bg-surface #242424, --accent #c2410c (ember), --text-primary #f4f4f5,
       --success #7fb069, --danger #c9504a, --warn #d9a441.
-    - src/environments/environment.ts with orderApi / inventoryApi / paymentApi URLs
-      (from the AppHost-provided env vars).
+    - RUNTIME config, not build-time. scripts/write-config.mjs reads ORDER_API_URL /
+      INVENTORY_API_URL / PAYMENT_API_URL / FULFILLMENT_API_URL and writes
+      public/config.js setting `window.__ORDERFLOW__`. index.html loads it
+      SYNCHRONOUSLY before the bundle. src/environments/environment.ts reads that
+      global with '' defaults. config.js is generated, gitignored, and rewritten by
+      postinstall, by `npm start`, and by the nginx entrypoint.
 
 [R] CRITICAL — Do NOT:
     1. Generate NgModules — Angular 20 standalone only.
@@ -1440,8 +1497,15 @@ PREFERRED — Do NOT:
        architecture demo; the UI is deliberately plain.
     3. Pin TypeScript to ~5.6/~5.7. Angular 20 needs 5.8.x — AI often grabs a stale
        "safe" version. Explicitly pin 5.8.
+    4. Bake the API URLs into the bundle (process.env in environment.ts, or a `define`
+       in angular.json). Aspire assigns a different port every run; a baked URL is
+       stale the moment the AppHost restarts.
     IMPORTANT — Do NOT:
-    4. Use the Webpack builder. Use @angular-devkit/build-angular:application.
+    5. Use @angular-devkit/build-angular. Its :application target is esbuild, but the
+       PACKAGE installs webpack + webpack-dev-server + karma anyway. Use @angular/build.
+    6. Let the served port drift off 4200. Every API's CORS policy whitelists exactly
+       one origin, http://localhost:4200 (B11 [R]1). Serve anywhere else and every call
+       the browser makes is blocked — a dead UI in front of five healthy services.
 
 [U] Served by Aspire as an npm app on :4200. Two surfaces only: a customer status
     view and an ops view. Plain by design.
@@ -1451,15 +1515,32 @@ PREFERRED — Do NOT:
 
 ## Prompt G2 — Core models + services 🤖
 
+> **`PlaceOrder` has no unit price, and its absence is the security control (ADR-006).** The write
+> shape carries a SKU and a quantity — nothing else. A `unitPrice` on the outbound line means the
+> browser sets the amount it will be charged, and every service downstream faithfully carries the
+> number it was given. Do not add it back to "match the form": **G4's form is what must not collect
+> it.** The field is present on the *inbound* `OrderLine` because the server decided it.
+> 
+> **Two services are missing from [S], and G5 cannot be built without them.**
+> 
+> - `fulfillment.service.ts` — `listStuck()`. G5's stuck panel reads "the fulfillment ops
+>   endpoint", so a client for it has to exist.
+> - `order.service.ts` also needs **`listDeadLetters()`**. Fulfillment's endpoint reports only
+>   failed *dispatches*. A dead-lettered `ReleaseInventory` means stock is stranded, and a
+>   dead-lettered `RefundPayment` means a customer is out of pocket for an order that already
+>   failed — the rows that cost real money, and the ones Fulfillment's endpoint cannot see. See G5.
+
 ```text
 [S] Create:
     - `src/app/core/models/models.ts` — interfaces matching the ServiceModels:
-      PlaceOrder, OrderLine, OrderStatus (with state string), SkuAvailability,
-      PaymentAttempt, StuckOrder.
+      PlaceOrder (customerRef + lines of {sku, quantity} — NO unitPrice, ADR-006),
+      OrderLine, OrderStatus (with state string), SkuAvailability, PaymentAttempt,
+      StuckOrder.
     - `src/app/core/services/order.service.ts` — place(order), getStatus(id),
-      listActive().
+      listActive(), listDeadLetters().
     - `src/app/core/services/inventory.service.ts` — listSkus().
     - `src/app/core/services/payment.service.ts` — getByOrder(id).
+    - `src/app/core/services/fulfillment.service.ts` — listStuck().
     Each `@Injectable({providedIn:'root'})`, inject(HttpClient), environment URLs,
     returning Observable<T>.
 
@@ -1497,10 +1578,28 @@ PREFERRED — Do NOT:
 
 ## Prompt G4 — Customer order view (place + live status) 🤖
 
+> **THIS PROMPT ASKED FOR THE ADR-006 VULNERABILITY BACK, AS A FORM FIELD.**
+> 
+> The original [S] read: *"a few line rows (SKU, qty, **unit price**)"*. That is a text box in which
+> the customer types the amount they will be charged. It is the *exact* defect ADR-006 exists to
+> close, re-introduced at the one layer where it is fully attacker-controlled — and it would have
+> looked completely natural in a code review, because a line item does have a unit price.
+> 
+> It fails harmlessly today only because the server-side `OrderLineViewModel` has no `UnitPrice`
+> property to bind to, so the posted value is discarded by the model binder. **The security does not
+> come from the form. It comes from the field not existing on the server.** But a form that collects
+> a price is a standing invitation for the next person to "fix the bug" by adding the property back
+> — at which point a customer buys a laptop for a penny.
+> 
+> Corrected: the form collects **SKU and quantity only**. The catalogue price is *displayed* beside
+> each line, read from `GET /api/Inventory`, so the customer knows what they are agreeing to — but
+> it is rendered from the server's answer and is not an input. There is no field whose value can
+> travel back. The authoritative total arrives on the order once Inventory prices it.
+
 ```text
 [S] Create `src/app/features/order/customer-order.component.ts`:
-    - A small form to place an order: customer ref + a few line rows (SKU, qty,
-      unit price). Submit → orderService.place() → capture the returned order id.
+    - A small form to place an order: customer ref + a few line rows (SKU, qty).
+      Submit → orderService.place() → capture the returned order id.
     - A live status panel that polls orderService.getStatus(id) every 2s and renders
       the saga states as a progression: Placed → Reserved → Paid → Dispatched →
       Confirmed, or a Failed state showing FailureReason.
@@ -1510,15 +1609,24 @@ PREFERRED — Do NOT:
       ngOnDestroy AND on reaching a terminal state.
     - Render the state progression as a simple stepper; the current state is
       highlighted in --accent, a Failed terminal in --danger.
+    - Populate the SKU dropdown from inventoryService.listSkus(), and DISPLAY that
+      catalogue price next to each line as read-only text so the customer can see what
+      they are agreeing to.
 
 [R] CRITICAL — Do NOT:
     1. Assume synchronous completion. Placing returns State=Placed; the rest arrives
        over subsequent polls as the saga advances. The UI must handle the async
        progression, not expect a finished order from the POST.
     2. Keep polling after a terminal state — it wastes calls and muddies the trace.
+    3. Put a unit-price INPUT on the form, or send unitPrice in the POST body. The
+       client does not price the order (ADR-006). Display the catalogue price; never
+       collect it. A price the browser can type is a price the browser can forge, and
+       the server would have no way to tell the difference.
     IMPORTANT — Do NOT:
-    3. Use SignalR/WebSockets. Polling is intentional for this POC (a TODO notes the
+    4. Use SignalR/WebSockets. Polling is intentional for this POC (a TODO notes the
        future SignalR move).
+    5. Show a bare "Failed" with no reason. FailureReason is the single most useful
+       fact the saga produced; it is why the failure paths are the deliverable.
 
 [U] The customer surface. Its whole job is to make the saga's asynchronous progression
     visible in real time — the same story the distributed trace tells, in the UI.
@@ -1528,23 +1636,46 @@ PREFERRED — Do NOT:
 
 ## Prompt G5 — Ops view (inventory, payments, stuck orders) 🤖
 
+> **The Fulfillment endpoint alone leaves the money-losing rows off the screen.** [S] sources the
+> stuck panel from "the fulfillment ops endpoint", which reports failed *dispatches* and nothing
+> else. But the dead-letter queues that actually cost money are `release-inventory` (stock stranded
+> forever) and `refund-payment` (a customer out of pocket for an order that already failed) — and
+> Fulfillment cannot see either. An ops lead would be looking at a clean screen while money was
+> stuck. This prompt predates `GET /api/Orders/dead-letters` (added in K2), which covers **every**
+> queue in the system.
+> 
+> Corrected: the panel merges both sources and shows the queue each row came from. The two overlap
+> on `dispatch-fulfillment`, so **dedupe on the broker's message id** — otherwise one stuck message
+> renders twice and implies two stuck orders where there is one.
+> 
+> **[R]1 (read-only) is why `POST /rebuild-projection` and the recovery endpoints are NOT on this
+> screen**, even though they exist. An operator poking the saga's state from outside is the thing a
+> saga exists to prevent; recovery is automatic (the sweeper), and this screen is how you watch it.
+
 ```text
 [S] Create `src/app/features/ops/ops.component.ts` with three panels:
     - Inventory: per-SKU OnHand / Reserved / Available (inventoryService.listSkus,
       poll 5s).
     - Active orders: the non-terminal orders (orderService.listActive, poll 5s) with
       their current state.
-    - Stuck / dead-lettered: orders sitting in a failed-dispatch/DLQ state WITH the
-      reason (from the fulfillment ops endpoint).
+    - Stuck / dead-lettered: every dead-lettered message WITH its reason, merged from
+      fulfillmentService.listStuck() AND orderService.listDeadLetters(), deduped on
+      messageId, newest first, each row labelled with its source queue.
 
 [C] - Signals + @for/@if. Clear intervals in ngOnDestroy.
     - Available <= 0 rendered in --danger; stuck rows in --warn with the reason shown.
+    - Fetch each panel independently: if one API is down the other two must still
+      render. A single combined subscription that errors blanks the whole ops screen
+      at exactly the moment an operator needs to look at it.
 
 [R] CRITICAL — Do NOT:
-    1. Offer any write action here (no manual state edits, no forced releases). Ops is
-       read-only observation for the demo.
+    1. Offer any write action here (no manual state edits, no forced releases, no
+       rebuild-projection button). Ops is read-only observation for the demo.
+    2. Source the stuck panel from Fulfillment alone. It cannot see the
+       release-inventory and refund-payment dead-letter queues — the rows where stock
+       is stranded and a customer is out of pocket.
     IMPORTANT — Do NOT:
-    2. Hide the failure reason on stuck orders — the reason IS the value of this panel.
+    3. Hide the failure reason on stuck orders — the reason IS the value of this panel.
 
 [U] The ops surface answers the first question a real operations lead asks: "show me
     what's stuck and why." Making that visible is worth more than any styling.
@@ -1564,6 +1695,32 @@ PREFERRED — Do NOT:
 > "../OrderFlow.Web", "start")` — emitted live back in A3 — resolves its directory EAGERLY, and
 > `src/OrderFlow.Web` does not exist until Part G. **A green build is not a running system, and
 > nothing in this library ever asked it to run.** Do not let a build be the only gate again.
+> 
+> **And when it was finally run, there were TWO MORE — both invisible to the compiler, each fatal.**
+> This is the entire justification for [R]4. The build had been green for the whole project.
+> 
+> **1. Five topics all named their subscription `order-saga`, and the host threw before a single
+> container started.** `AddServiceBusSubscription(name, subscriptionName)` takes an **Aspire resource
+> name** first — global across the whole app model, *not* scoped to its topic — and the **broker**
+> subscription name second. Passing one argument makes them the same string, so the second topic to
+> declare `order-saga` collided with the first:
+> `Cannot add resource ... with name 'order-saga' because resource ... with that name already exists`.
+> The consumers bind to the *broker* name, which must stay `order-saga`/`notification`; only the
+> resource name has to be unique. Fixed by naming them `"{topic}-saga"` / `"{topic}-notification"`
+> and passing the broker name explicitly as the second argument.
+> 
+> **2. A topic with no subscribers segfaulted the entire message bus.** The AppHost declared an
+> `order-placed` topic, commented "published for the audit trail". It was never published to —
+> `OrderBusinessManager.PlaceAsync` *appends* OrderPlaced to the Cosmos event log and sends
+> `ReserveInventory`; nothing writes that topic and nothing subscribes to it. The audit trail is the
+> event log (ADR-002); the topic was a misremembering of it. But **the Service Bus emulator refuses to
+> start a topic with zero subscriptions** — `"At least one subscription required per topic"` — and it
+> exits 139 (SIGSEGV). One unused, unpublished, unsubscribed line of dead infrastructure took the
+> broker down, and with the broker down nothing in the system works. Dead infrastructure is not free.
+> Deleted.
+> 
+> Both were found in the first ten seconds of actually running the thing. Neither would ever have
+> been found by building it.
 
 ```text
 [S] - Edit `src/OrderFlow.AppHost/OrderFlow.AppHost.csproj` to add ProjectReference
@@ -1614,6 +1771,18 @@ PREFERRED — Do NOT:
 
 ## Prompt H2 — Happy-path sanity check ✏️
 
+> **RUN AND PASSED (2026-07-14), after the two startup bugs in H1 were fixed.** Five services and four
+> emulated backing resources reached Healthy; an order crossed all five services in **~2.7 seconds**.
+> The event log is the proof, not the logs:
+> `OrderPlaced → InventoryReserved → PaymentSucceeded → FulfillmentDispatched → OrderConfirmed`
+> (`GET /api/Orders/{id}/timeline`, sequences 1–5). Stock went 40 → **38 on hand, 0 reserved**, so
+> `CommitInventory` genuinely consumed the hold rather than leaving it dangling. Exactly **one** payment
+> row (`Captured`, auth code masked). Dead-letter queues empty.
+> 
+> **ADR-006 was proven live here, incidentally.** The POST came back `total: 0, unitPrice: 0` — the
+> client sent only SKU and quantity, so the order was *unpriced* until Inventory answered. The final
+> total (158.00 = 2 × 79.00) came from the catalogue, not the browser.
+
 ```text
 [S] Run `dotnet build`, then `dotnet run --project src/OrderFlow.AppHost`. Verify in
     the Aspire dashboard that SQL, Cosmos emulator, Redis, Service Bus emulator, and
@@ -1634,6 +1803,77 @@ PREFERRED — Do NOT:
 ```
 
 ## Prompt H3 — Failure-injection walkthrough (the demo) ✏️
+
+> **ALL EIGHT RUN (2026-07-14). Seven behave correctly; TWO ROWS OF THE MATRIX ARE THEMSELVES WRONG
+> (#3 and #7) — the code is right and the prompt is not. Details below.**
+> 
+> **#1 Duplicate payment callback — PASSED.** The saga's `ChargePayment` was replayed onto
+> `charge-payment` with the **identical** deterministic MessageId — a real redelivery, not a lookalike.
+> Payment rows still **1**, same `createdUtc` (not even updated), state unchanged, no second
+> `PaymentSucceeded`, DLQ empty (the duplicate was *completed*, not dead-lettered). The
+> `(ConsumerName, MessageId)` guard held.
+> 
+> **#3 "Payment gateway transient down" — CANNOT BE DRIVEN. THIS ROW IS WRONG.** There is no lever, and
+> nothing to retry. `SimulatedPaymentAuthorizer` exposes only `DeclineAll` and `DeclineOverAmount`, and
+> **a decline is a business outcome, not a transient fault** — retrying it is the bug D2 [R]3 forbids.
+> Payment has no resilience pipeline at all; the retry/backoff/circuit-breaker lives in **Fulfillment's
+> `CarrierClient`**. Ran the equivalent that does exist —
+> `--Parameters:carrier-failure-mode=TransientRecovering` (fails twice, then succeeds) — and the order
+> reached Confirmed with **0** dead letters and no compensation: the transient fault was absorbed.
+> Either reword this row to name the carrier, or add a `payment-transient-failures` parameter and a
+> pipeline to Payment. Do not leave it implying a retry that does not exist.
+> 
+> **#6 Notification provider down — PASSED.** With `--Parameters:notification-provider-down=true` the
+> order still reached **Confirmed** on the full happy path. The notification row records
+> `status=Dropped, attempts=3` with its reason; DLQ stayed **0**. A terminal subscriber tried three
+> times, gave up, and left the order untouched — F1 [R]1/[R]2 exactly.
+> 
+> **#7 Poison message — dead-letters correctly, but NOT "after max delivery". THIS ROW IS ALSO WRONG.**
+> An unparseable body on `charge-payment` landed in the DLQ with `reason=DeserializationFailed` and
+> **`deliveryCount=0`** — dead-lettered on the FIRST delivery, by design (`ServiceBusConsumer`: *"Poison
+> messages dead-letter immediately… cannot be fixed by retrying"*). Four attempts at invalid JSON cannot
+> succeed; they only delay visibility and waste broker capacity. The outcome the row cares about — in
+> the DLQ, reason attached, replayable — holds; the stated *mechanism* does not. Reword to
+> "dead-letters with its reason, without burning the delivery count."
+> 
+> **#8 Stranded order / recovery sweeper — PASSED. The cleanest result in the set.** Stopped the Service
+> Bus container, POSTed an order (Cosmos append and Redis projection succeeded; `SendCommandAsync` could
+> not, and the customer got an error), restarted the broker. The order sat at `Placed` in
+> `GET /api/Orders/stuck`; ~30s later the sweeper re-drove it to **Confirmed (79.00)** with **one**
+> order, **one** payment row, and a complete five-event timeline. The failed send was a *delay*, not a
+> lost order — ADR-007's entire claim, demonstrated.
+> 
+> **Separately — the Orders API failed to start on 1 of 6 AppHost runs**, while the other four came up
+> fine; a restart fixed it. It depends on Cosmos, Redis AND Service Bus, so that is a startup race — and
+> in a live demo it is a one-in-six chance of a dead front page. **The AppHost logged no error at all**,
+> which is exactly why H2 [R]1 exists. Worth hardening before anyone presents this.
+> 
+> **#2 Concurrent last-unit purchase — PASSED.** Two orders for `SKU-LAST-1` (OnHand=1) placed **4.5 ms
+> apart**. One Confirmed (9.99); one Failed with *"Insufficient stock for SKU 'SKU-LAST-1': 1
+> requested."* Final stock `onHand=0, reserved=0` — **no oversell**. The row-version guard (C2 [R]1)
+> firing under a genuine race, which is the one thing a unit test with EF InMemory could never prove.
+> 
+> **#5 Payment declined after reservation — PASSED.** `SKU-LAPTOP-01` at 1299.99 trips the
+> `payment-decline-over-amount` limit of 1000 with no restart needed, so it declines *after* stock is
+> held. Timeline: `OrderPlaced → InventoryReserved → PaymentDeclined → OrderFailed`. Stock returned to
+> `25 / reserved 0` — the hold was released, satisfying [R]2. Payment row `Declined`, never captured.
+> 
+> **#4 Carrier hard failure after payment — PASSED, and it settles the ADR-004 open item.** Run with
+> `--Parameters:carrier-failure-mode=Permanent`. Timeline:
+> `OrderPlaced → InventoryReserved → PaymentSucceeded → FulfillmentFailed → OrderFailed`. Payment went
+> `Captured → **Refunded**`, with Amount (73.50) and AuthorizationCode unchanged — D2 [B] honoured.
+> Stock returned to `200 / reserved 0`. **Dead-letter count: 0.**
+> 
+> That zero is the point. ADR-004 says Fulfillment does *"dead-lettering on hard failure"*, and the code
+> deliberately does not. Had it obeyed the ADR literally, the saga would never have been told: money
+> captured, stock held, order frozen at `Paid` forever. Instead the failure was **answered**
+> (`FulfillmentFailed` published, message completed), the saga compensated, and the DLQ stayed empty.
+> **The code is right; the ADR's wording is wrong** — now demonstrated rather than argued.
+> 
+> **Tooling note.** #1 and #7 cannot be driven through the HTTP surface — they need a message placed
+> directly on the broker (a redelivery with the *same* MessageId; a body that does not parse). A tiny
+> throwaway sender against the emulator is enough, and it belongs outside `src/`. That gap is the real
+> argument for K4: without it, two of the eight rows are untestable and quietly get marked "fine".
 
 ```text
 [S] Exercise each row of the Failure Handling matrix and confirm the expected
@@ -1685,7 +1925,7 @@ PREFERRED — Do NOT:
 > Everything in Parts A–H builds and, once H1 is fixed, runs. It is also, at that point,
 > **wrong in ways that only show up when something breaks** — which, for an architecture whose
 > entire subject is failure paths, is the only place it matters.
->
+> 
 > These prompts came out of a critical review of the finished build. They are in dependency order:
 > K1 fixes things that lose orders, K2 makes the system's own claims true, K3 closes the gaps the
 > library papered over, K4 makes the failure matrix executable. **Run K1 before demoing anything.**

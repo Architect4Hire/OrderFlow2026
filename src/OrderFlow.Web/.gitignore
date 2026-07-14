@@ -1,0 +1,8 @@
+node_modules/
+dist/
+out-tsc/
+.angular/
+
+# Generated at start-up from Aspire's environment variables (scripts/write-config.mjs). Committing it
+# would pin whatever ports one machine happened to assign, and every other machine would inherit them.
+public/config.js

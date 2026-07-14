@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>OrderFlow</title>
+    <base href="/" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <!--
+      Loaded BEFORE the bundle, and synchronously, so window.__ORDERFLOW__ exists by the time
+      environment.ts is evaluated. Generated at start-up from Aspire's env vars — see
+      scripts/write-config.mjs. Not deferred, not async: the app reads it during module init.
+    -->
+    <script src="config.js"></script>
+  </head>
+  <body>
+    <of-root></of-root>
+  </body>
+</html>

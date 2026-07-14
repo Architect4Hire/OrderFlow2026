@@ -50,6 +50,18 @@ public static class Extensions
             http.AddServiceDiscovery();
         });
 
+        // Already the .NET default — stated explicitly because it is a DECISION, and because the
+        // obvious "fix" for a crashing consumer is to flip it to Ignore.
+        //
+        // Do not. Every consumer in OrderFlow is a BackgroundService, and a service whose consumer
+        // failed to start is not a degraded service — it is a black hole. Messages arrive on a queue
+        // nobody reads, the order stops moving, and the API happily reports Healthy the whole time.
+        // Crashing is the mercy: it is loud, it is obvious, and Aspire shows it. The startup RACE that
+        // used to cause those crashes is handled where it belongs — ServiceBusConsumer retries the
+        // attach — so anything that still reaches here is a real misconfiguration and should be fatal.
+        builder.Services.Configure<HostOptions>(host =>
+            host.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.StopHost);
+
         return builder;
     }
 
