@@ -25,10 +25,11 @@
          ships as a package, not in the shared framework, so Scalar alone gives a blank page. -->
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.10" />
 
-    <!-- Pinned above the 2.0.0 that Microsoft.AspNetCore.OpenApi drags in transitively: that
-         version carries GHSA-v5pm-xwqc-g5wc (high — circular schema references terminate OpenAPI
-         parsing), patched in 2.7.5. -->
-    <PackageReference Include="Microsoft.OpenApi" Version="3.8.0" />
+    <!-- Pinned to the 2.x line that Microsoft.AspNetCore.OpenApi 10.0's source generator targets.
+         That generator emits `mediaType.Example = …`; 3.x makes Example read-only on IOpenApiMediaType,
+         so a 3.x reference breaks the generated code with CS0200. 2.7.5 is the patched build for
+         GHSA-v5pm-xwqc-g5wc (high — circular schema references terminate OpenAPI parsing) on the 2.x
+         line, so it is above the vulnerable transitive 2.0.0 without crossing into 3.x. Do NOT bump to 3.x. -->
     <PackageReference Include="Scalar.AspNetCore" Version="2.16.12" />
   </ItemGroup>
 

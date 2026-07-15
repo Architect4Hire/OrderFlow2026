@@ -15,6 +15,7 @@ import { environment, isConfigured } from '../environments/environment';
       <nav>
         <a routerLink="/order" routerLinkActive="active">Place Order</a>
         <a routerLink="/ops" routerLinkActive="active">Ops</a>
+        <a routerLink="/lab" routerLinkActive="active">Failure Lab</a>
       </nav>
     </header>
 
