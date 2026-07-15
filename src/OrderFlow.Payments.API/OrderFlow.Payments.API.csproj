@@ -17,14 +17,14 @@
   <ItemGroup>
     <!-- Brings EF Core + the SQL Server provider, and wires the "PaymentDb" connection string,
          health check and telemetry from the AppHost. -->
-    <PackageReference Include="Aspire.Microsoft.EntityFrameworkCore.SqlServer" Version="13.3.0" />
+    <PackageReference Include="Aspire.Microsoft.EntityFrameworkCore.SqlServer" Version="13.4.6" />
 
-    <PackageReference Include="Azure.Messaging.ServiceBus" Version="7.20.1" />
+    <PackageReference Include="Azure.Messaging.ServiceBus" Version="7.20.2" />
 
     <!-- Scalar renders an OpenAPI document; it does not produce one. In .NET 10 the generator
          ships as a package, not in the shared framework, so Scalar alone gives a blank page. -->
-    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.9" />
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.7">
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.10" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.10">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
@@ -32,8 +32,8 @@
     <!-- Pinned above the 2.0.0 that Microsoft.AspNetCore.OpenApi drags in transitively: that
          version carries GHSA-v5pm-xwqc-g5wc (high — circular schema references terminate OpenAPI
          parsing), patched in 2.7.5. -->
-    <PackageReference Include="Microsoft.OpenApi" Version="2.7.5" />
-    <PackageReference Include="Scalar.AspNetCore" Version="2.16.11" />
+    <PackageReference Include="Microsoft.OpenApi" Version="3.8.0" />
+    <PackageReference Include="Scalar.AspNetCore" Version="2.16.12" />
   </ItemGroup>
 
 </Project>
